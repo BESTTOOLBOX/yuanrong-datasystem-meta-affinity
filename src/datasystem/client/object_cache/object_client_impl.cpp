@@ -1,9 +1,12 @@
 /**
  * Copyright (c) Huawei Technologies Co., Ltd. 2022. All rights reserved.
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,6 +18,7 @@
  * Description: Data system Object Client implementation.
  */
 
+#include "datasystem/client/object_cache/meta_affinity/meta_affinity_client_ring_source.h"
 #include "datasystem/client/object_cache/object_client_impl.h"
 
 #include "datasystem/protos/object_posix.brpc.stub.pb.h"
@@ -23,8 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -38,23 +41,14 @@
 #include <vector>
 
 #include <tbb/concurrent_hash_map.h>
+#include <nlohmann/json.hpp>
 
 #include "datasystem/client/client_flags_monitor.h"
 #include "datasystem/client/mmap/immap_table_entry.h"
-#include "datasystem/client/routing/routing.h"
-#include "datasystem/client/transport/object_buffer_internal.h"
-#include "datasystem/client/transport/transport_layer.h"
-#include "datasystem/client/transport/worker_snapshot.h"
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
-#include "datasystem/client/object_cache/exist_handler.h"
-#include "datasystem/client/routing/broken_filter.h"
-#include "datasystem/client/routing/hash_ring_refresher.h"
-#include "datasystem/client/routing/worker_router.h"
 #include "datasystem/common/device/device_manager_factory.h"
 #include "datasystem/common/device/device_helper.h"
-#include "datasystem/common/flags/common_flags.h"
 #include "datasystem/common/flags/flags.h"
-#include "datasystem/common/iam/tenant_auth_manager.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/metrics/metrics.h"
@@ -74,16 +68,13 @@
 #include "datasystem/common/rdma/urma_manager.h"
 #endif
 #ifdef USE_NPU
-#include "datasystem/common/device/ascend/acl_device_manager.h"
 #include "datasystem/common/rdma/npu/remote_h2d_manager.h"
 #endif
-#include "datasystem/common/rpc/api_deadline.h"
-#include "datasystem/common/rpc/timeout_duration.h"
 #include "datasystem/common/rpc/rpc_constants.h"
 #include "datasystem/common/string_intern/string_ref.h"
 #include "datasystem/common/util/format.h"
-#include "datasystem/common/flags/dynamic_config_updater.h"
-#include "datasystem/common/flags/dynamic_flag_config.h"
+#include "datasystem/common/util/gflag/dynamic_config_updater.h"
+#include "datasystem/common/util/gflag/flags.h"
 #include "datasystem/common/util/memory.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/random_data.h"
@@ -91,7 +82,6 @@
 #include "datasystem/common/util/rpc_diagnostic.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/thread_local.h"
-#include "datasystem/common/util/request_context.h"
 #include "datasystem/common/util/timer.h"
 #include "datasystem/common/util/uri.h"
 #include "datasystem/common/util/validator.h"
@@ -108,6 +98,8 @@
 #include "datasystem/object/buffer.h"
 
 DS_DECLARE_bool(log_monitor);
+DS_DECLARE_bool(enable_meta_affinity_replicate);
+DS_DECLARE_bool(enable_distributed_master);
 
 static constexpr size_t OBJ_META_MAX_SIZE_LIMIT = 64;
 static constexpr size_t QUERY_SIZE_OBJECT_LIMIT = 10000;
@@ -125,7 +117,6 @@ constexpr double US_PER_MS = 1000.0;
 namespace datasystem {
 namespace {
 constexpr size_t MIN_SHUFFLE_CANDIDATE_COUNT = 2;
-constexpr size_t SET_ROUTE_MAX_ATTEMPTS = 3;
 const std::unordered_set<std::string> NON_GFLAG_KV_CLIENT_CONFIG_KEYS = {
     "client_access_log_filename",
     "client_log_without_pid",
@@ -162,8 +153,8 @@ void ShuffleWorkerCandidates(std::vector<HostPort> &candidates)
 
 void LogClientConfigInitSnapshot()
 {
-    DynamicFlagConfig flagConfig;
-    OperationLogger::Instance().LogConfigInit(flagConfig.GetAllFlagsStr());
+    Flags flags;
+    OperationLogger::Instance().LogConfigInit(flags.GetAllFlagsStr());
 }
 
 std::unordered_map<std::string, std::string> GetGflagArgs(const KVClientConfig &clientConfig)
@@ -328,7 +319,6 @@ void NotifySwitchToExpectedWorker(const HostPort &target)
 static constexpr int32_t INIT_SELECT_WORKER_RETRY_INTERVAL_MS = 100;
 static constexpr int32_t INIT_SELECT_WORKER_NO_WORKER_RETRY_INTERVAL_MS = 500;
 static constexpr int32_t INIT_SELECT_WORKER_TRIES = 6;
-
 }  // namespace
 
 ObjectClientImpl::ObjectClientImpl(const ConnectOptions &connectOptions1)
@@ -342,12 +332,10 @@ ObjectClientImpl::ObjectClientImpl(const ConnectOptions &connectOptions1)
     connectTimeoutMs_ = connectOptions.connectTimeoutMs;
     requestTimeoutMs_ = connectOptions.requestTimeoutMs != 0 ? connectOptions.requestTimeoutMs : connectTimeoutMs_;
     token_ = connectOptions.token;
-    transportToken_ = std::make_shared<const SensitiveValue>(connectOptions.token);
     tenantId_ = connectOptions.tenantId;
     signature_ = std::make_unique<Signature>(connectOptions.accessKey, connectOptions.secretKey);
+    enableExclusiveConnection_ = connectOptions.enableExclusiveConnection;
     enableCrossNodeConnection_ = connectOptions.enableCrossNodeConnection;
-    enableLocalCache_ = connectOptions.enableLocalCache;
-    transportSignature_ = std::make_shared<Signature>(connectOptions.accessKey, connectOptions.secretKey);
     (void)authKeys_.SetClientPublicKey(connectOptions.clientPublicKey);
     (void)authKeys_.SetClientPrivateKey(connectOptions.clientPrivateKey);
     LOG_IF_ERROR(authKeys_.SetServerKey(WORKER_SERVER_NAME, connectOptions.serverPublicKey),
@@ -364,21 +352,6 @@ ObjectClientImpl::~ObjectClientImpl()
     clientStateManager_->ProcessDestruct(shutdownFunc);
 }
 
-void ObjectClientImpl::CleanupPreRegisteredDeviceMemory()
-{
-#ifdef USE_NPU
-    std::vector<void *> addrs;
-    {
-        std::lock_guard<std::mutex> lock(preRegisteredDeviceMemoryMutex_);
-        addrs.swap(preRegisteredDeviceMemoryAddrs_);
-    }
-    if (!addrs.empty()) {
-        LOG_IF_ERROR(RemoteH2DManager::Instance().UnregisterDeviceMemory(addrs),
-                     "Failed to unregister pre-registered RemoteH2D device memory");
-    }
-#endif
-}
-
 Status ObjectClientImpl::ShutDown(bool &needRollbackState, bool isDestruct)
 {
     ShutdownMetricsThread(!isDestruct);
@@ -393,30 +366,22 @@ Status ObjectClientImpl::ShutDown(bool &needRollbackState, bool isDestruct)
     }
     TraceGuard traceGuard = Trace::Instance().SetTraceUUID();
 
-    // Stop new release submissions and drain queued reference releases while worker transports are still alive.
+    asyncSetRPCPool_ = nullptr;
+    asyncGetRPCPool_ = nullptr;
+    asyncGetCopyPool_ = nullptr;
+    asyncDevDeletePool_ = nullptr;
+    // Protect concurrent read and write access to asyncReleasePool_ variable and don't hold the lock when release the
+    // thread pool.
     auto asyncReleasePool = asyncReleasePool_;
     {
         std::lock_guard<std::shared_timed_mutex> lck(shutdownMux_);
         asyncReleasePool_ = nullptr;
     }
     asyncReleasePool = nullptr;
-    auto routing = std::atomic_exchange(&routing_, std::shared_ptr<client::Routing>{});
-    if (routing != nullptr) {
-        routing->Shutdown();
-    }
-    if (transportLayer_ != nullptr) {
-        transportLayer_->Shutdown();
-        transportLayer_.reset();
-    }
-    asyncSetRPCPool_ = nullptr;
-    asyncGetRPCPool_ = nullptr;
-    asyncGetCopyPool_ = nullptr;
-    asyncDevDeletePool_ = nullptr;
 
     if (devOcImpl_ != nullptr) {
         devOcImpl_->SetThreadInterruptFlag2True();
     }
-    CleanupPreRegisteredDeviceMemory();
 
     // Step0: notify wait post.
     switchPost_.Set();
@@ -467,22 +432,13 @@ Status ObjectClientImpl::ParseEmbeddedConfig(const EmbeddedConfig &config)
 {
     const auto &args = config.GetArgs();
     if (args.find("system_access_key") != args.end() && args.find("system_secret_key") != args.end()) {
-        RETURN_IF_NOT_OK(signature_->SetClientAkSk(args.at("system_access_key"), args.at("system_secret_key")));
-        RETURN_RUNTIME_ERROR_IF_NULL(transportSignature_);
-        RETURN_IF_NOT_OK(
-            transportSignature_->SetClientAkSk(args.at("system_access_key"), args.at("system_secret_key")));
+        signature_->SetClientAkSk(args.at("system_access_key"), args.at("system_secret_key"));
     }
     if (args.find("connectTimeoutMs") != args.end()) {
         int result = 0;
         CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Uri::StrToInt(args.at("connectTimeoutMs").c_str(), result),
                                              K_RUNTIME_ERROR, "connectTimeoutMs to int failed");
         connectTimeoutMs_ = result;
-    }
-    if (args.find("requestTimeoutMs") != args.end()) {
-        int result = 0;
-        CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Uri::StrToInt(args.at("requestTimeoutMs").c_str(), result),
-                                             K_RUNTIME_ERROR, "requestTimeoutMs to int failed");
-        requestTimeoutMs_ = result;
     }
     return Status::OK();
 }
@@ -518,57 +474,6 @@ void ObjectClientImpl::ConstructTreadPool()
     asyncReleasePool_ = std::make_shared<ThreadPool>(0, 4, "async_release_buffer");
 }
 
-Status ObjectClientImpl::InitTransportLayer()
-{
-    if (transportLayer_ != nullptr) {
-        return Status::OK();
-    }
-    RETURN_RUNTIME_ERROR_IF_NULL(transportSignature_);
-    RETURN_RUNTIME_ERROR_IF_NULL(asyncGetRPCPool_);
-    RETURN_RUNTIME_ERROR_IF_NULL(asyncReleasePool_);
-    auto transportLayer =
-        std::make_unique<client::TransportLayer>(transportSignature_, asyncGetRPCPool_, fastTransportMemSize_,
-                                                 BrpcChannelConfig{}, asyncReleasePool_);
-    RETURN_IF_NOT_OK(transportLayer->Init());
-    transportLayer_ = std::move(transportLayer);
-    LOG(INFO) << "Client transport layer initialized";
-    return Status::OK();
-}
-
-Status ObjectClientImpl::ApplyRoutingWorkerSnapshot(uint64_t ringVersion,
-                                                    const ::datasystem::ClusterTopologyPb &ring)
-{
-    RETURN_RUNTIME_ERROR_IF_NULL(transportLayer_);
-    client::WorkerSnapshot snapshot;
-    RETURN_IF_NOT_OK(client::BuildWorkerSnapshot(ringVersion, ring, snapshot));
-    return transportLayer_->ApplyWorkerSnapshot(std::move(snapshot));
-}
-
-Status ObjectClientImpl::InitRouting(const HostPort &initialWorker, bool initialWorkerIsLocal)
-{
-    if (std::atomic_load(&routing_) != nullptr) {
-        return Status::OK();
-    }
-    CHECK_FAIL_RETURN_STATUS(!initialWorker.Empty(), K_NOT_READY,
-                             "Initial worker address is unavailable for routing initialization");
-    RETURN_IF_NOT_OK(client::ParseDataPlacementPolicy(FLAGS_sdk_data_placement_policy, dataPlacementPolicy_));
-    auto ringUpdateHook = [this](uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring) {
-        return ApplyRoutingWorkerSnapshot(ringVersion, ring);
-    };
-    RETURN_RUNTIME_ERROR_IF_NULL(transportSignature_);
-    BrpcChannelConfig channelConfig;
-    channelConfig.timeout_ms = requestTimeoutMs_;
-    channelConfig.connect_timeout_ms = connectTimeoutMs_;
-    channelConfig.max_retry = 0;
-    channelConfig.enable_circuit_breaker = false;
-    auto routing = std::make_shared<client::Routing>(std::move(channelConfig), transportSignature_,
-                                                     std::move(ringUpdateHook));
-    RETURN_IF_NOT_OK(routing->Init("", initialWorker, initialWorkerIsLocal));
-    std::atomic_store(&routing_, std::move(routing));
-    LOG(INFO) << "[Routing] Object client routing initialized from worker " << initialWorker.ToString();
-    return Status::OK();
-}
-
 Status ObjectClientImpl::InitClientWorkerConnect(bool enableHeartbeat, bool initWithWorker, int32_t connectTimeoutMs)
 {
     int32_t timeoutMs = connectTimeoutMs >= 0 ? connectTimeoutMs : connectTimeoutMs_;
@@ -585,7 +490,7 @@ Status ObjectClientImpl::InitClientWorkerConnectAt(WorkerNode node, const HostPo
     if (!initWithWorker) {
         workerApi_[node] =
             std::make_shared<ClientWorkerRemoteApi>(address, cred_, heartbeatType, token_, signature_.get(), tenantId_,
-                                                    enableCrossNodeConnection_, deviceId_);
+                                                    enableCrossNodeConnection_, enableExclusiveConnection_, deviceId_);
     } else {
         workerApi_[node] = std::make_shared<ClientWorkerLocalApi>(address, embeddedClientWorkerApi_, worker_,
                                                                   heartbeatType, signature_.get(), false, deviceId_);
@@ -605,9 +510,8 @@ void ObjectClientImpl::ConfigureUrmaDataPlaneFailureCallback(WorkerNode node,
         return;
     }
     std::weak_ptr<client::IClientWorkerCommonApi> weakWorkerApi(workerApi);
-    workerApi->SetUrmaDataPlaneFailureCallback([this, node, weakWorkerApi]() {
-        return SubmitUrmaDataPlaneSwitch(node, weakWorkerApi);
-    });
+    workerApi->SetUrmaDataPlaneFailureCallback(
+        [this, node, weakWorkerApi]() { return SubmitUrmaDataPlaneSwitch(node, weakWorkerApi); });
 }
 
 bool ObjectClientImpl::SubmitUrmaDataPlaneSwitch(WorkerNode node,
@@ -647,8 +551,8 @@ bool ObjectClientImpl::SubmitUrmaDataPlaneSwitch(WorkerNode node,
     return true;
 }
 
-bool ObjectClientImpl::IsCurrentUrmaDataPlaneTrigger(
-    WorkerNode node, const std::shared_ptr<client::IClientWorkerCommonApi> &workerApi)
+bool ObjectClientImpl::IsCurrentUrmaDataPlaneTrigger(WorkerNode node,
+                                                     const std::shared_ptr<client::IClientWorkerCommonApi> &workerApi)
 {
     std::lock_guard<std::mutex> lock(switchNodeMutex_);
     return currentNode_ == node && workerApi_[node] != nullptr && workerApi_[node].get() == workerApi.get();
@@ -659,9 +563,6 @@ Status ObjectClientImpl::InitClientRuntimeAt(WorkerNode node, bool initWithWorke
     auto &workerApi = workerApi_[node];
     mmapManager_ = std::make_unique<client::MmapManager>(workerApi, initWithWorker);
     ConstructTreadPool();
-    if (!enableLocalCache_) {
-        RETURN_IF_NOT_OK(InitTransportLayer());
-    }
 
     RETURN_IF_NOT_OK(workerApi->PrepairForDecreaseShmRef(std::bind(
         &client::MmapManager::LookupUnitsAndMmapFd, mmapManager_.get(), std::placeholders::_1, std::placeholders::_2)));
@@ -671,9 +572,6 @@ Status ObjectClientImpl::InitClientRuntimeAt(WorkerNode node, bool initWithWorke
     clientEnableP2Ptransfer_ = workerApi->workerEnableP2Ptransfer_;
     RETURN_IF_NOT_OK(InitListenWorkerAt(node, isLocalWorker));
     RETURN_IF_NOT_OK(workerApi->TryFastTransportAfterHeartbeat());
-    if (!enableLocalCache_) {
-        RETURN_IF_NOT_OK(InitRouting(workerApi->hostPort_, isLocalWorker));
-    }
     devOcImpl_ = std::make_unique<ClientDeviceObjectManager>(this);
     RETURN_IF_NOT_OK(devOcImpl_->Init());
     memoryRefCount_.SetSupportMultiShmRefCount(workerApi->workerSupportMultiShmRefCount_);
@@ -747,15 +645,6 @@ void ObjectClientImpl::ClearFailedInitAttempt()
     ShutdownMetricsThread(false);
     ShutdownPerfThread();
     ShutdownShmRefReconcileThread();
-    asyncReleasePool_ = nullptr;
-    auto routing = std::atomic_exchange(&routing_, std::shared_ptr<client::Routing>{});
-    if (routing != nullptr) {
-        routing->Shutdown();
-    }
-    if (transportLayer_ != nullptr) {
-        transportLayer_->Shutdown();
-        transportLayer_.reset();
-    }
     for (auto &listener : listenWorker_) {
         if (listener != nullptr) {
             listener->StopListenWorker(true);
@@ -778,6 +667,7 @@ void ObjectClientImpl::ClearFailedInitAttempt()
     asyncGetCopyPool_ = nullptr;
     asyncSwitchWorkerPool_ = nullptr;
     asyncDevDeletePool_ = nullptr;
+    asyncReleasePool_ = nullptr;
 }
 
 Status ObjectClientImpl::Init(bool &needRollbackState, bool enableHeartbeat, const KVClientConfig *clientConfig)
@@ -823,16 +713,8 @@ Status ObjectClientImpl::InitWorkerClientAtCurrentAddress(bool enableHeartbeat, 
         rc = InitClientWorkerConnect(enableHeartbeat, false, connectTimeoutMs);
     }
     RETURN_IF_NOT_OK(rc);
+    OsXprtPipln::SwitchToAndGetGpuId(deviceId_);
     LogClientConfigInitSnapshot();
-    return Status::OK();
-}
-
-Status ObjectClientImpl::GetCurrentWorkerHostPort(HostPort &addr) const
-{
-    std::lock_guard<std::mutex> lock(switchNodeMutex_);
-    auto workerApi = workerApi_[currentNode_];
-    CHECK_FAIL_RETURN_STATUS(workerApi != nullptr, K_NOT_READY, "Current worker API is not initialized");
-    addr = workerApi->hostPort_;
     return Status::OK();
 }
 
@@ -955,7 +837,7 @@ void ObjectClientImpl::ProcessWorkerLost()
         return mmapManager_->LookupUnitsAndMmapFd("", shmUnitInfo);
     });
     if (rc2.IsError()) {
-        LOG(ERROR) << PIPLN_LOG_PREFIX "Reconnect: InitQueue failed: " << rc2.ToString();
+        LOG(ERROR) << "[Reconnect] Failed to prepare for pipelineRh2dQueue:" << rc2.ToString();
         return;
     }
     listenWorker_[LOCAL_WORKER]->SetWorkerAvailable(true);
@@ -1230,32 +1112,21 @@ bool ObjectClientImpl::CommitStandbySwitch(WorkerNode current, WorkerNode next, 
                                            const std::shared_ptr<IClientWorkerApi> &candidateWorkerApi,
                                            const std::shared_ptr<client::ListenWorker> &candidateListenWorker)
 {
-    std::shared_ptr<client::ListenWorker> retiredLocalListenWorker;
-    {
-        std::lock_guard<std::mutex> lock(switchNodeMutex_);
-        if (!switchInProgress_ || switchGeneration_ != switchGeneration || currentNode_ != current
-            || (clientStateManager_->GetState() & (uint16_t)ClientState::EXITED)) {
-            return false;
-        }
-        workerApi_[next] = candidateWorkerApi;
-        listenWorker_[next] = candidateListenWorker;
-        currentNode_ = next;
-        if (mmapManager_ != nullptr) {
-            mmapManager_->CleanInvalidMmapTable();
-        }
-        // Stop the LOCAL_WORKER listener only when standby-side rediscovery can take over;
-        // otherwise it is still the only recovery path.
-        if (serviceDiscovery_ != nullptr && serviceDiscovery_->HasHostAffinity()
-            && listenWorker_[LOCAL_WORKER] != nullptr) {
-            retiredLocalListenWorker = listenWorker_[LOCAL_WORKER];
-        }
-        MarkWorkerAvailableLocked();
+    std::lock_guard<std::mutex> lock(switchNodeMutex_);
+    if (!switchInProgress_ || switchGeneration_ != switchGeneration || currentNode_ != current
+        || (clientStateManager_->GetState() & (uint16_t)ClientState::EXITED)) {
+        return false;
     }
-    if (retiredLocalListenWorker != nullptr) {
-        retiredLocalListenWorker->StopListenWorker(false);
-        retiredLocalListenWorker->JoinListenWorker();
-        LOG_IF_ERROR(retiredLocalListenWorker->NotifyClientRemovable(), "[Switch] Notify old local client removable");
+    workerApi_[next] = candidateWorkerApi;
+    listenWorker_[next] = candidateListenWorker;
+    currentNode_ = next;
+    // Stop the LOCAL_WORKER listener only when standby-side rediscovery can take over;
+    // otherwise it is still the only recovery path.
+    if (serviceDiscovery_ != nullptr && serviceDiscovery_->HasHostAffinity()
+        && listenWorker_[LOCAL_WORKER] != nullptr) {
+        listenWorker_[LOCAL_WORKER]->StopListenWorker(false);
     }
+    MarkWorkerAvailableLocked();
     return true;
 }
 
@@ -1265,7 +1136,7 @@ ObjectClientImpl::StandbySwitchAttemptResult ObjectClientImpl::TrySwitchToStandb
 {
     HeartbeatType heartbeatType = currentApi->heartbeatType_;
     auto candidateWorkerApi = currentApi->CloneWith(standbyWorker, cred_, heartbeatType, token_, signature_.get(),
-                                                    tenantId_, enableCrossNodeConnection_,
+                                                    tenantId_, enableCrossNodeConnection_, enableExclusiveConnection_,
                                                     embeddedClientWorkerApi_, worker_);
     candidateWorkerApi->isUseStandbyWorker_ = true;
     ConfigureUrmaDataPlaneFailureCallback(next, candidateWorkerApi);
@@ -1298,7 +1169,6 @@ ObjectClientImpl::StandbySwitchAttemptResult ObjectClientImpl::TrySwitchToStandb
         LOG(WARNING) << FormatString("[Switch] Fast transport init failed for worker(%s), with status: %s",
                                      standbyWorker.ToString(), rc.ToString());
     }
-
     if (!WaitStandbyWorkerReady(candidateWorkerApi)) {
         LOG(ERROR) << FormatString("[Switch] client %s wait for worker %s ready failed", GetClientId(),
                                    candidateWorkerApi->hostPort_.ToString());
@@ -1326,10 +1196,6 @@ ObjectClientImpl::StandbySwitchAttemptResult ObjectClientImpl::TrySwitchToLocalS
     if (PreparePreferredLocalWorker(localAddress, heartbeatType, localWorkerApi, localMmapManager, localListenWorker)
             .IsError()) {
         return StandbySwitchAttemptResult::CONTINUE;
-    }
-    Status rc = localWorkerApi->TryFastTransportAfterHeartbeat();
-    if (rc.IsError()) {
-        LOG(WARNING) << "[Switch] URMA handshake failed: " << rc.ToString();
     }
     // Declared outside the lock so the old listener's destructor (which joins its heartbeat
     // thread) runs after switchNodeMutex_ is released; otherwise it can deadlock against
@@ -1473,7 +1339,7 @@ Status ObjectClientImpl::PreparePreferredLocalWorker(const HostPort &localAddres
 {
     localWorkerApi =
         std::make_shared<ClientWorkerRemoteApi>(localAddress, cred_, heartbeatType, token_, signature_.get(), tenantId_,
-                                                enableCrossNodeConnection_, deviceId_);
+                                                enableCrossNodeConnection_, enableExclusiveConnection_, deviceId_);
     Status rc = localWorkerApi->Init(requestTimeoutMs_, connectTimeoutMs_, fastTransportMemSize_);
     if (rc.IsError()) {
         LOG(ERROR) << "[Switch] Init preferred same-node worker " << localAddress.ToString()
@@ -1645,14 +1511,93 @@ Status ObjectClientImpl::GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi>
     return Status::OK();
 }
 
+bool ObjectClientImpl::HasHealthyLocalWorker() const
+{
+    if (workerApi_.size() <= LOCAL_WORKER || workerApi_[LOCAL_WORKER] == nullptr) {
+        return false;
+    }
+    if (listenWorker_.size() <= LOCAL_WORKER || listenWorker_[LOCAL_WORKER] == nullptr) {
+        return false;
+    }
+    return listenWorker_[LOCAL_WORKER]->CheckWorkerAvailable().IsOk();
+}
+
+bool ObjectClientImpl::ShouldRouteWriteToMetaOwner() const
+{
+    return FLAGS_enable_meta_affinity_replicate && FLAGS_enable_distributed_master && !HasHealthyLocalWorker();
+}
+
+Status ObjectClientImpl::EnsureMetaAffinityRingSource()
+{
+    std::lock_guard<std::mutex> lock(metaAffinityWriteMutex_);
+    if (metaAffinityRingSource_ != nullptr) {
+        return Status::OK();
+    }
+    std::shared_ptr<IClientWorkerApi> gateway;
+    {
+        std::lock_guard<std::mutex> switchLock(switchNodeMutex_);
+        if (workerApi_.size() > STANDBY1_WORKER && workerApi_[STANDBY1_WORKER] != nullptr) {
+            gateway = workerApi_[STANDBY1_WORKER];
+        } else if (workerApi_.size() > LOCAL_WORKER && workerApi_[LOCAL_WORKER] != nullptr) {
+            gateway = workerApi_[LOCAL_WORKER];
+        }
+    }
+    if (gateway == nullptr) {
+        RETURN_STATUS(K_INVALID, "No worker api for meta affinity route bootstrap");
+    }
+    metaAffinityRingSource_ =
+        std::make_shared<MetaAffinityClientRingSource>(gateway, signature_.get(), requestTimeoutMs_);
+    return metaAffinityRingSource_->BootstrapRing();
+}
+
+Status ObjectClientImpl::GetWriteWorkerApi(const std::string &objectKey, std::shared_ptr<IClientWorkerApi> &workerApi,
+                                           std::unique_ptr<Raii> &raii)
+{
+    if (!ShouldRouteWriteToMetaOwner()) {
+        return GetAvailableWorkerApi(workerApi, raii);
+    }
+    RETURN_IF_NOT_OK(EnsureMetaAffinityRingSource());
+    HostPort metaOwner;
+    RETURN_IF_NOT_OK(metaAffinityRingSource_->RefreshForRouteLookup());
+    RETURN_IF_NOT_OK(metaAffinityRingSource_->GetMetaAddress(objectKey, metaOwner));
+
+    std::lock_guard<std::mutex> lock(metaAffinityWriteMutex_);
+    if (workerApi_.size() > STANDBY1_WORKER && workerApi_[STANDBY1_WORKER] != nullptr
+        && workerApi_[STANDBY1_WORKER]->hostPort_ == metaOwner) {
+        workerApi = workerApi_[STANDBY1_WORKER];
+        RETURN_IF_NOT_OK(CheckConnection(STANDBY1_WORKER));
+        workerApi->IncreaseInvokeCount();
+        raii = std::make_unique<Raii>([workerApi]() { workerApi->DecreaseInvokeCount(); });
+        return Status::OK();
+    }
+
+    if (metaAffinityWriteWorkerApi_ == nullptr || metaAffinityWriteWorkerAddress_ != metaOwner) {
+        metaAffinityWriteWorkerApi_ = std::make_shared<ClientWorkerRemoteApi>(
+            metaOwner, cred_, HeartbeatType::NO_HEARTBEAT, token_, signature_.get(), tenantId_,
+            enableCrossNodeConnection_, enableExclusiveConnection_, deviceId_);
+        metaAffinityWriteWorkerApi_->isUseStandbyWorker_ = true;
+        RETURN_IF_NOT_OK(
+            metaAffinityWriteWorkerApi_->Init(requestTimeoutMs_, connectTimeoutMs_, fastTransportMemSize_));
+        metaAffinityWriteWorkerAddress_ = metaOwner;
+    }
+    workerApi = metaAffinityWriteWorkerApi_;
+    CHECK_FAIL_RETURN_STATUS(workerApi->healthy_, K_RPC_UNAVAILABLE, "Meta affinity write worker is unavailable");
+    workerApi->IncreaseInvokeCount();
+    raii = std::make_unique<Raii>([workerApi]() { workerApi->DecreaseInvokeCount(); });
+    LOG(INFO) << FormatString("[MetaAffinityWrite] route object %s to meta owner worker %s", objectKey,
+                              metaOwner.ToString());
+    return Status::OK();
+}
+
 Status ObjectClientImpl::MGetH2D(const std::vector<std::string> &objectKeys,
                                  const std::vector<DeviceBlobList> &devBlobList, std::vector<std::string> &failedKeys,
                                  uint64_t timeoutMs)
 {
     PerfPoint perfPoint(PerfKey::HETERO_CLIENT_MGET_H2D);
     auto access = AccessRecorder::Object(AccessRecorderKey::DS_HETERO_CLIENT_MGETH2D);
-    access.ObjectKeysSummaryRef(objectKeys)
-        .DataSizeProvider([&devBlobList] { return CalculateDeviceBlobSize(devBlobList); });
+    access.ObjectKeysSummaryRef(objectKeys).DataSizeProvider([&devBlobList] {
+        return CalculateDeviceBlobSize(devBlobList);
+    });
 
     auto rc = CheckMGetH2DInput(objectKeys, devBlobList);
     if (rc.IsError()) {
@@ -1712,8 +1657,9 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncMGetH2D(const std::vector
     }
 
     auto asyncState = std::make_shared<AsyncMGetH2DState>(objectKeys, devBlobList);
-    access->ObjectKeysSummaryRef(asyncState->objectKeys)
-        .DataSizeProvider([asyncState] { return CalculateDeviceBlobSize(asyncState->devBlobList); });
+    access->ObjectKeysSummaryRef(asyncState->objectKeys).DataSizeProvider([asyncState] {
+        return CalculateDeviceBlobSize(asyncState->devBlobList);
+    });
     std::shared_future<AsyncResult> future = asyncState->promise.get_future().share();
 
     auto traceContext = Trace::Instance().GetContext();
@@ -1745,8 +1691,8 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncMGetH2D(const std::vector
             return Status::OK();
         });
 
-    auto copyCompleteTask = [this, traceContext,
-        asyncState = std::move(asyncState), access = std::move(access)]() mutable {
+    auto copyCompleteTask = [this, traceContext, asyncState = std::move(asyncState),
+                             access = std::move(access)]() mutable {
         TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
         auto rc = asyncState->rpcFuture.get();
         if (rc.IsOk()) {
@@ -1798,39 +1744,6 @@ Status ObjectClientImpl::MGetH2DImpl(const std::vector<std::string> &objectKeys,
     return rc;
 }
 
-Status ObjectClientImpl::PreRegisterDeviceMemory(const std::vector<void *> &data, const std::vector<uint64_t> &dataSize)
-{
-#ifndef USE_NPU
-    (void)data;
-    (void)dataSize;
-    return Status(K_NOT_SUPPORTED, "RemoteH2D device memory pre-registration is only supported in NPU builds.");
-#else
-    RETURN_IF_NOT_OK(IsClientReady());
-    CHECK_FAIL_RETURN_STATUS(!data.empty(), K_INVALID, "Device memory address list cannot be empty.");
-    CHECK_FAIL_RETURN_STATUS(data.size() == dataSize.size(), K_INVALID,
-                             FormatString("Device memory address count %zu does not match size count %zu.",
-                                          data.size(), dataSize.size()));
-    for (size_t i = 0; i < data.size(); ++i) {
-        CHECK_FAIL_RETURN_STATUS(data[i] != nullptr, K_INVALID,
-                                 FormatString("Device memory address cannot be null, index: %zu.", i));
-        CHECK_FAIL_RETURN_STATUS(dataSize[i] > 0, K_INVALID,
-                                 FormatString("Device memory size must be greater than 0, index: %zu.", i));
-    }
-
-    int32_t deviceId = -1;
-    RETURN_IF_NOT_OK(acl::AclDeviceManager::Instance()->GetDeviceIdx(deviceId));
-    CHECK_FAIL_RETURN_STATUS(deviceId >= 0, K_INVALID,
-                             "Device id is not initialized. Set current device before pre-registering device memory.");
-    RETURN_IF_NOT_OK(UpdateClientRemoteH2DConfig(deviceId));
-    RETURN_IF_NOT_OK(RemoteH2DManager::Instance().PreRegisterDeviceMemory(data, dataSize));
-    {
-        std::lock_guard<std::mutex> lock(preRegisteredDeviceMemoryMutex_);
-        preRegisteredDeviceMemoryAddrs_.insert(preRegisteredDeviceMemoryAddrs_.end(), data.begin(), data.end());
-    }
-    return Status::OK();
-#endif
-}
-
 Status ObjectClientImpl::CheckMGetH2DInput(const std::vector<std::string> &objectKeys,
                                            const std::vector<DeviceBlobList> &devBlobList)
 {
@@ -1851,78 +1764,6 @@ Status ObjectClientImpl::CheckMGetH2DInput(const std::vector<std::string> &objec
     return Status::OK();
 }
 
-#ifdef USE_NPU
-static Status InitRemoteH2DComm(const std::vector<Buffer *> &existBufferList,
-                                std::shared_ptr<RemoteH2DContext> &p2pComm)
-{
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(RemoteH2DManager::Instance().SetDeviceIdx(),
-                                     "[RH2D][ScatterBatch][Client] SetDeviceIdx failed");
-    P2pKind kind = P2P_RECEIVER;
-    // Buffers are grouped by data source, so root info should be the same for these objects.
-    const auto &rootInfo = existBufferList[0]->GetRemoteHostInfo()->root_info();
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-        RemoteH2DManager::Instance().P2PCommInitRootInfo(rootInfo.internal(), rootInfo, kind, p2pComm),
-        "[RH2D][ScatterBatch][Client] P2PCommInitRootInfo failed");
-    return Status::OK();
-}
-
-static Status FillScatterEntry(size_t index, DeviceBlobList *devBlobList, Buffer *buffer,
-                               const std::shared_ptr<RemoteH2DContext> &p2pComm, P2pScatterEntry &entry,
-                               std::vector<void *> &dstBufs, std::vector<uint64_t> &counts)
-{
-    auto *remoteHostInfo = buffer->GetRemoteHostInfo();
-    auto &seg = remoteHostInfo->remote_host_segment();
-    auto &hostDataInfo = remoteHostInfo->data_info();
-    auto &blobs = devBlobList->blobs;
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-        RemoteH2DManager::Instance().ImportHostSegment(p2pComm->remoteEndpoint, seg),
-        FormatString("[RH2D][ScatterBatch][Client] ImportHostSegment failed, index=%zu, segLen=%zu, "
-                     "dataOffset=%zu",
-                     index, seg.seg_len(), seg.seg_data_offset()));
-
-    CHECK_FAIL_RETURN_STATUS(
-        seg.seg_data_offset() + hostDataInfo.offset() < seg.seg_len(), K_RUNTIME_ERROR,
-        FormatString("The offset overflow, starting point:%zu + blob offset:%zu > segment size:%zu",
-                     seg.seg_data_offset(), hostDataInfo.offset(), seg.seg_len()));
-    entry.ddrBuf = reinterpret_cast<void *>(seg.seg_va() + seg.seg_data_offset() + hostDataInfo.offset());
-    entry.numEl = hostDataInfo.sizes_size();
-    CHECK_FAIL_RETURN_STATUS(
-        entry.numEl == blobs.size() && entry.numEl > 0, K_INVALID,
-        FormatString("Blobs count mismatch in devBlobList between sender and receiver, sender count is: %ld, "
-                     "receiver count is: %ld, mismatch devBlobList index: %zu, mismatch key index: %zu",
-                     entry.numEl, blobs.size(), index, index));
-
-    dstBufs.resize(entry.numEl);
-    counts.resize(entry.numEl);
-    for (size_t j = 0; j < entry.numEl; j++) {
-        // Double check the sizes and offsets, and prepare the dstBufs and counts for the Get Scatter.
-        auto hostDataSize = hostDataInfo.sizes(j);
-        auto deviceDataSize = blobs[j].size;
-        CHECK_FAIL_RETURN_STATUS(static_cast<size_t>(hostDataSize) == deviceDataSize, K_RUNTIME_ERROR,
-                                 "The data size of device and host is not equal.");
-        dstBufs[j] = blobs[j].pointer;
-        counts[j] = deviceDataSize;
-    }
-    entry.dstBufs = dstBufs.data();
-    entry.counts = counts.data();
-    entry.dataType = HCCL_DATA_TYPE_UINT8;
-    return Status::OK();
-}
-
-static Status FillScatterEntries(std::vector<DeviceBlobList *> &devBlobList, std::vector<Buffer *> &existBufferList,
-                                 const std::shared_ptr<RemoteH2DContext> &p2pComm,
-                                 std::vector<P2pScatterEntry> &entries,
-                                 std::vector<std::vector<void *>> &dstBufs,
-                                 std::vector<std::vector<uint64_t>> &counts)
-{
-    for (size_t i = 0; i < existBufferList.size(); i++) {
-        RETURN_IF_NOT_OK(FillScatterEntry(i, devBlobList[i], existBufferList[i], p2pComm, entries[i], dstBufs[i],
-                                          counts[i]));
-    }
-    return Status::OK();
-}
-#endif
-
 static Status ImportSegAndReadHostMemory(std::vector<DeviceBlobList *> &devBlobList,
                                          std::vector<Buffer *> &existBufferList)
 {
@@ -1932,8 +1773,12 @@ static Status ImportSegAndReadHostMemory(std::vector<DeviceBlobList *> &devBlobL
     // 1. Initialize communicator connection.
     // Note that client uses worker side root info as the key.
     PerfPoint point(PerfKey::CLIENT_IMPORT_SEG_AND_READ);
+    RETURN_IF_NOT_OK(RemoteH2DManager::Instance().SetDeviceIdx());
+    P2pKind kind = P2P_RECEIVER;
     std::shared_ptr<RemoteH2DContext> p2pComm;
-    RETURN_IF_NOT_OK(InitRemoteH2DComm(existBufferList, p2pComm));
+    // Buffers are grouped by data source, so root info should be the same for these objects.
+    const auto &rootInfo = existBufferList[0]->GetRemoteHostInfo()->root_info();
+    RETURN_IF_NOT_OK(RemoteH2DManager::Instance().P2PCommInitRootInfo(rootInfo.internal(), rootInfo, kind, p2pComm));
 
     // 2. Import the remote host segment.
     // 3. Read from remote host memory.
@@ -1943,11 +1788,46 @@ static Status ImportSegAndReadHostMemory(std::vector<DeviceBlobList *> &devBlobL
     std::vector<std::vector<void *>> dstBufs(existBufferList.size());
     std::vector<std::vector<uint64_t>> counts(existBufferList.size());
 
-    RETURN_IF_NOT_OK(FillScatterEntries(devBlobList, existBufferList, p2pComm, entries, dstBufs, counts));
+    // Construct P2pScatterEntries
+    for (size_t i = 0; i < existBufferList.size(); i++) {
+        auto buffer = existBufferList[i];
+        auto *remoteHostInfo = buffer->GetRemoteHostInfo();
+        auto &seg = remoteHostInfo->remote_host_segment();
+        auto &hostDataInfo = remoteHostInfo->data_info();
+        auto &blobs = devBlobList[i]->blobs;
+        RETURN_IF_NOT_OK(RemoteH2DManager::Instance().ImportHostSegment(p2pComm->remoteEndpoint, seg));
 
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-        RemoteH2DManager::Instance().ScatterBatch(entries.data(), entries.size(), p2pComm),
-        FormatString("[RH2D][ScatterBatch][Client] ScatterBatch failed, entries=%zu", entries.size()));
+        auto &entry = entries[i];
+        CHECK_FAIL_RETURN_STATUS(
+            seg.seg_data_offset() + hostDataInfo.offset() < seg.seg_len(), K_RUNTIME_ERROR,
+            FormatString("The offset overflow, starting point:%zu + blob offset:%zu > segment size:%zu",
+                         seg.seg_data_offset(), hostDataInfo.offset(), seg.seg_len()));
+        entry.ddrBuf = reinterpret_cast<void *>(seg.seg_va() + seg.seg_data_offset() + hostDataInfo.offset());
+        entry.numEl = hostDataInfo.sizes_size();
+        CHECK_FAIL_RETURN_STATUS(
+            entry.numEl == blobs.size() && entry.numEl > 0, K_INVALID,
+            FormatString("Blobs count mismatch in devBlobList between sender and receiver, sender count is: %ld, "
+                         "receiver count is: %ld, mismatch devBlobList index: %zu, mismatch key index: %zu",
+                         entry.numEl, blobs.size(), i, i));
+        dstBufs[i].resize(entry.numEl);
+        counts[i].resize(entry.numEl);
+
+        for (size_t j = 0; j < entry.numEl; j++) {
+            // Double check the sizes and offsets, and prepare the dstBufs and counts for the Get Scatter.
+            auto hostDataSize = hostDataInfo.sizes(j);
+            auto deviceDataSize = blobs[j].size;
+            CHECK_FAIL_RETURN_STATUS(static_cast<size_t>(hostDataSize) == deviceDataSize, K_RUNTIME_ERROR,
+                                     "The data size of device and host is not equal.");
+            dstBufs[i][j] = blobs[j].pointer;
+            counts[i][j] = deviceDataSize;
+        }
+        HcclDataType dataType = HCCL_DATA_TYPE_UINT8;
+        entry.dstBufs = dstBufs[i].data();
+        entry.counts = counts[i].data();
+        entry.dataType = dataType;
+    }
+
+    RETURN_IF_NOT_OK(RemoteH2DManager::Instance().ScatterBatch(entries.data(), entries.size(), p2pComm));
 #endif
     return Status::OK();
 }
@@ -2029,8 +1909,7 @@ Status ObjectClientImpl::DeviceDataCreate(const std::vector<std::string> &object
                                          "Check device failed.");
     }
     BlobListInfo blobInfo;
-    const auto memoryAlignment = workerApi_[LOCAL_WORKER]->GetMemoryAlignment();
-    RETURN_IF_NOT_OK(PrepareDataSizeList(dataSizeList, devBlobList, blobInfo, memoryAlignment));
+    RETURN_IF_NOT_OK(PrepareDataSizeList(dataSizeList, devBlobList, blobInfo));
     LOG(INFO) << blobInfo.ToString(true);
     exists.resize(objectKeys.size(), false);
     RETURN_IF_NOT_OK(MultiCreate(objectKeys, dataSizeList, param, false, bufferList, exists));
@@ -2054,7 +1933,7 @@ Status ObjectClientImpl::DeviceDataCreate(const std::vector<std::string> &object
         return Status::OK();
     }
     point.RecordAndReset(PerfKey::CLIENT_D2H_MEMCPY);
-    ComposeBufferData(bufferList, filterDevBlobList, memoryAlignment);
+    ComposeBufferData(bufferList, filterDevBlobList);
     std::vector<Buffer *> bufferRawPtrList;
     bufferRawPtrList.reserve(bufferList.size());
     for (auto &buff : bufferList) {
@@ -2071,8 +1950,9 @@ Status ObjectClientImpl::MSetD2H(const std::vector<std::string> &objectKeys,
 {
     PerfPoint perfPoint(PerfKey::HETERO_CLIENT_MSET_D2H);
     auto access = AccessRecorder::Object(AccessRecorderKey::DS_HETERO_CLIENT_MSETD2H);
-    access.ObjectKeysSummaryRef(objectKeys)
-        .DataSizeProvider([&devBlobList] { return CalculateDeviceBlobSize(devBlobList); });
+    access.ObjectKeysSummaryRef(objectKeys).DataSizeProvider([&devBlobList] {
+        return CalculateDeviceBlobSize(devBlobList);
+    });
     auto rc = CheckMSetD2HInput(objectKeys, devBlobList, setParam);
     if (rc.IsError()) {
         access.Result(rc).Record();
@@ -2106,13 +1986,13 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncMSetD2H(const std::vector
     }
 
     auto asyncState = std::make_shared<AsyncMSetD2HState>(objectKeys, devBlobList, setParam);
-    access->ObjectKeysSummaryRef(asyncState->objectKeys)
-        .DataSizeProvider([asyncState] { return CalculateDeviceBlobSize(asyncState->devBlobList); });
+    access->ObjectKeysSummaryRef(asyncState->objectKeys).DataSizeProvider([asyncState] {
+        return CalculateDeviceBlobSize(asyncState->devBlobList);
+    });
 
     auto traceContext = Trace::Instance().GetContext();
     return asyncSetRPCPool_->Submit(
-        [this, traceContext,
-         asyncState = std::move(asyncState), access = std::move(access)]() mutable {
+        [this, traceContext, asyncState = std::move(asyncState), access = std::move(access)]() mutable {
             TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
             auto rc = MSetD2HImpl(asyncState->objectKeys, asyncState->devBlobList, asyncState->setParam);
             access->Result(rc).Record();
@@ -2227,7 +2107,6 @@ Status ObjectClientImpl::Create(const std::string &objectKey, uint64_t dataSize,
 {
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     CHECK_FAIL_RETURN_STATUS(!objectKey.empty(), K_INVALID, "The objectKey is empty");
     RETURN_IF_NOT_OK(CheckValidObjectKey(objectKey));
     CHECK_FAIL_RETURN_STATUS(dataSize > 0, K_INVALID, "The dataSize value should be bigger than zero.");
@@ -2238,7 +2117,7 @@ Status ObjectClientImpl::Create(const std::string &objectKey, uint64_t dataSize,
     }
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
     PerfPoint createPoint(PerfKey::CLIENT_CREATE_OBJECT);
     VLOG(1) << "Begin to create object, object_key: " << objectKey;
     buffer.reset();  // Decrease should precede increase to avoid worker lost (ref cnt will be clear) and then restart.
@@ -2252,22 +2131,6 @@ Status ObjectClientImpl::Create(const std::string &objectKey, uint64_t dataSize,
     createPoint.Record();
     VLOG(1) << "Finished creating object, object_key: " << objectKey;
     return Status::OK();
-}
-
-std::shared_ptr<ObjectBufferInfo> ObjectClientImpl::MakeUbPoolBufferInfo(const std::string &objectKey,
-                                                                         uint64_t dataSize, const FullParam &param,
-                                                                         uint32_t version, const ShmKey &shmId)
-{
-#ifdef USE_URMA
-    std::shared_ptr<UrmaManager::BufferHandle> ubBufHandle;
-    if (UrmaManager::Instance().GetMemoryBufferHandle(ubBufHandle, dataSize).IsOk()) {
-        auto info = MakeObjectBufferInfo(objectKey, static_cast<uint8_t*>(ubBufHandle->GetPointer()),
-                                         dataSize, 0, param, false, version, shmId);
-        info->ubGetBufferHandle = ubBufHandle;
-        return info;
-    }
-#endif
-    return MakeObjectBufferInfo(objectKey, nullptr, dataSize, 0, param, false, version, shmId);
 }
 
 Status ObjectClientImpl::CreateShmBuffer(const std::string &objectKey, uint64_t dataSize, const FullParam &param,
@@ -2306,7 +2169,7 @@ Status ObjectClientImpl::CreateShmBuffer(const std::string &objectKey, uint64_t 
                 MakeObjectBufferInfo(objectKey, (uint8_t *)(shmBuf->pointer) + shmBuf->offset, dataSize, metadataSize,
                                      param, false, version, shmBuf->id, nullptr, std::move(mmapEntry));
         } else {
-            bufferInfo = MakeUbPoolBufferInfo(objectKey, dataSize, param, version, shmBuf->id);
+            bufferInfo = MakeObjectBufferInfo(objectKey, nullptr, dataSize, 0, param, false, version, shmBuf->id);
         }
         // Store URMA info for later use in SendBufferViaUb.
         bufferInfo->ubUrmaDataInfo = urmaDataInfo;
@@ -2362,7 +2225,7 @@ Status ObjectClientImpl::MultiCreate(const std::vector<std::string> &objectKeyLi
     // Pre-condition check for whether we should attempt shared memory or UB
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKeyList.front(), workerApi, raii));
     bool canUseShm = workerApi->IsShmEnable() && dataSizeSum >= workerApi->shmThreshold_;
     if (canUseShm || IsUrmaEnabled() || !skipCheckExistence) {
         if (!skipCheckExistence) {
@@ -2434,7 +2297,6 @@ void ObjectClientImpl::BatchReleaseBufferPtr(const std::vector<Buffer *> &buffer
 
 void ObjectClientImpl::BatchDecreaseRefCnt(const std::vector<std::pair<ShmKey, std::uint32_t>> &shmInfos)
 {
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     auto decreaseRefCnt = [this](const std::vector<std::pair<ShmKey, std::uint32_t>> &shmInfos) {
         std::vector<ShmKey> decreaseShms;
         for (auto &info : shmInfos) {
@@ -2467,22 +2329,10 @@ void ObjectClientImpl::DecreaseReferenceCnt(const ShmKey &shmId, bool isShm, uin
         METRIC_INC(metrics::KvMetricId::CLIENT_DEC_REF_SKIPPED_TOTAL);
         return;
     }
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    int64_t apiRemainingUs = ApiDeadline::Instance().ApiRemainingUs();
-    auto dispatchTime = std::chrono::steady_clock::now();
     bool async = true;
     INJECT_POINT("client.DecreaseReferenceCnt", [&async](bool value) { async = value; });
     if (async) {
-        asyncReleasePool_->Execute([this, shmId, isShm, version, apiRemainingUs, dispatchTime] {
-            ApiDeadline::Instance().Push();
-            Raii deadlineRaii([]() { ApiDeadline::Instance().Pop(); });
-            auto queueDelayUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - dispatchTime)
-                                    .count();
-            int64_t actualRemainingUs = apiRemainingUs - queueDelayUs;
-            if (actualRemainingUs > 0) {
-                ApiDeadline::Instance().InitUs(actualRemainingUs);
-            }
+        asyncReleasePool_->Execute([this, shmId, isShm, version] {
             LOG_IF_ERROR(DecreaseReferenceCntImpl(shmId, isShm, version), "DecreaseReferenceCntImpl failed");
         });
     } else {
@@ -2513,27 +2363,18 @@ Status ObjectClientImpl::DecreaseReferenceCntImpl(const ShmKey &shmId, bool isSh
 
 Status ObjectClientImpl::UpdateToken(SensitiveValue &token)
 {
-    SensitiveValue tokenCopy(token);
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
-    RETURN_IF_NOT_OK(workerApi->UpdateToken(token));
-    std::atomic_store(&transportToken_, std::make_shared<const SensitiveValue>(std::move(tokenCopy)));
-    return Status::OK();
+    return workerApi->UpdateToken(token);
 }
 
 Status ObjectClientImpl::UpdateAkSk(const std::string &accessKey, SensitiveValue &secretKey)
 {
-    if (!enableLocalCache_) {
-        return Status(K_NOT_SUPPORTED, "UpdateAkSk is not supported when local cache is disabled");
-    }
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
-    SensitiveValue transportSecretKey(secretKey);
-    RETURN_IF_NOT_OK(workerApi->UpdateAkSk(accessKey, secretKey));
-    RETURN_RUNTIME_ERROR_IF_NULL(transportSignature_);
-    return transportSignature_->SetClientAkSk(accessKey, std::move(transportSecretKey));
+    return workerApi->UpdateAkSk(accessKey, secretKey);
 }
 
 Status ObjectClientImpl::UpdateConfig(const std::string &configJson)
@@ -2550,7 +2391,7 @@ Status ObjectClientImpl::UpdateConfig(const std::string &configJson)
             }
         }
     }
-    DynamicConfigUpdater updater(FlagsMonitor::GetInstance()->GetDynamicFlagConfig());
+    DynamicConfigUpdater updater(FlagsMonitor::GetInstance()->GetFlags());
     return updater.ApplyJson(configJson, "UpdateConfig");
 }
 
@@ -2559,7 +2400,6 @@ Status ObjectClientImpl::Seal(const std::shared_ptr<ObjectBufferInfo> &bufferInf
 {
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     PerfPoint sealPoint(PerfKey::CLIENT_SEAL_OBJECT);
     RETURN_IF_NOT_OK(CheckConnection());
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(nestedObjectKeys, true));
@@ -2572,7 +2412,10 @@ Status ObjectClientImpl::Seal(const std::shared_ptr<ObjectBufferInfo> &bufferInf
     }
     VLOG(1) << "Begin to seal object, object_key: " << objectKey;
     PerfPoint rpcPoint(PerfKey::RPC_CLIENT_SEAL_OBJECT);
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerApi_[LOCAL_WORKER]->Publish(bufferInfo, isShm, true, nestedObjectKeys),
+    std::shared_ptr<IClientWorkerApi> workerApi;
+    std::unique_ptr<Raii> raii;
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerApi->Publish(bufferInfo, isShm, true, nestedObjectKeys),
                                      FormatString("Seal object %s", objectKey));
     rpcPoint.Record();
     VLOG(1) << "Finished sealing object, object_key: " << objectKey;
@@ -2585,7 +2428,6 @@ Status ObjectClientImpl::Publish(const std::shared_ptr<ObjectBufferInfo> &buffer
 {
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     auto config = GetClientLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
     PerfPoint perfPoint(PerfKey::CLIENT_PUBLISH_OBJECT);
@@ -2601,7 +2443,7 @@ Status ObjectClientImpl::Publish(const std::shared_ptr<ObjectBufferInfo> &buffer
     bufferInfo->isSeal = false;
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
     Timer timer;
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_START);
@@ -2629,15 +2471,6 @@ Status ObjectClientImpl::SendBufferViaUb(const std::shared_ptr<ObjectBufferInfo>
     return api->SendBufferViaUb(bufferInfo, data, length, traceEnabled);
 }
 
-Status ObjectClientImpl::SendBufferViaUbFromPool(const std::shared_ptr<ObjectBufferInfo> &bufferInfo,
-                                                 const void *data, uint64_t length, bool traceEnabled)
-{
-    std::shared_ptr<IClientWorkerApi> api;
-    std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(api, raii));
-    return api->SendBufferViaUbFromPool(bufferInfo, data, length, traceEnabled);
-}
-
 Status ObjectClientImpl::InvalidateBuffer(const std::string &objectKey)
 {
     RETURN_IF_NOT_OK(IsClientReady());
@@ -2647,43 +2480,10 @@ Status ObjectClientImpl::InvalidateBuffer(const std::string &objectKey)
     return Status::OK();
 }
 
-Status ObjectClientImpl::TimedMmapLookupWithDeadline(const std::shared_ptr<ShmUnitInfo> &shmBuf, uint64_t size)
-{
-    RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
-    Timer mmapTimer;
-    auto mmapRc = mmapManager_->LookupUnitsAndMmapFd("", shmBuf);
-    int64_t mmapCostUs = mmapTimer.ElapsedMicroSecond();
-    int64_t mmapRemainingUs = ApiDeadline::Instance().ApiRemainingUs();
-    SLOW_LOG_IF_OR_VLOG(INFO, mmapCostUs >= TimeoutDuration::SLOW_PATH_LOG_THRESHOLD_US || mmapRc.IsError(), 1,
-        FormatString("[Set] phase=mmap costUs=%lld remainingUs=%lld size=%zu rc=%s",
-                     mmapCostUs, mmapRemainingUs, size, mmapRc.ToString()));
-    return mmapRc;
-}
-
-Status ObjectClientImpl::TimedMemoryCopyWithDeadline(const std::shared_ptr<Buffer> &buffer, const uint8_t *data,
-                                                     uint64_t size, bool traceEnabled)
-{
-    RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
-    if (traceEnabled) {
-        Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_MEMORY_COPY_START);
-    }
-    Timer copyTimer;
-    // Copy user data into the shared memory buffer.
-    // no need call WLatch, the other thread cannot change before publish.
-    auto copyRc = buffer->MemoryCopy(data, size);
-    int64_t copyCostUs = copyTimer.ElapsedMicroSecond();
-    int64_t copyRemainingUs = ApiDeadline::Instance().ApiRemainingUs();
-    SLOW_LOG_IF_OR_VLOG(INFO, copyCostUs >= TimeoutDuration::SLOW_PATH_LOG_THRESHOLD_US || copyRc.IsError(), 1,
-        FormatString("[Set] phase=MemoryCopy costUs=%lld remainingUs=%lld size=%zu rc=%s",
-                     copyCostUs, copyRemainingUs, size, copyRc.ToString()));
-    RETURN_IF_NOT_OK(copyRc);
-    return ApiDeadline::Instance().CheckApiDeadline();
-}
-
 Status ObjectClientImpl::ProcessShmPut(const std::string &objectKey, const uint8_t *data, uint64_t size,
                                        const FullParam &param, const std::unordered_set<std::string> &nestedObjectKeys,
                                        uint32_t ttlSecond, const std::shared_ptr<IClientWorkerApi> &workerApi,
-                                       int existence, SetFailureStage &failureStage)
+                                       int existence)
 {
     auto config = GetClientLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
@@ -2695,22 +2495,20 @@ Status ObjectClientImpl::ProcessShmPut(const std::string &objectKey, const uint8
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_CREATE_RPC_START);
     }
-    failureStage = SetFailureStage::CREATE;
     RETURN_IF_NOT_OK(workerApi->Create(objectKey, size, version, metadataSize, shmBuf, urmaDataInfo, param.cacheType));
-    failureStage = SetFailureStage::TRANSFER;
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_CREATE_RPC_END);
     }
     std::shared_ptr<ObjectBufferInfo> objInfo = nullptr;
     std::shared_ptr<client::IMmapTableEntry> mmapEntry = nullptr;
     if (!urmaDataInfo) {
-        RETURN_IF_NOT_OK(TimedMmapLookupWithDeadline(shmBuf, size));
+        RETURN_IF_NOT_OK(mmapManager_->LookupUnitsAndMmapFd("", shmBuf));
         mmapEntry = mmapManager_->GetMmapEntryByFd(shmBuf->fd);
         CHECK_FAIL_RETURN_STATUS(mmapEntry != nullptr, StatusCode::K_RUNTIME_ERROR, "Get mmap entry failed");
         objInfo = MakeObjectBufferInfo(objectKey, (uint8_t *)(shmBuf->pointer) + shmBuf->offset, size, metadataSize,
                                        param, false, version, shmBuf->id, nullptr, std::move(mmapEntry));
     } else {
-        objInfo = MakeUbPoolBufferInfo(objectKey, size, param, version, shmBuf->id);
+        objInfo = MakeObjectBufferInfo(objectKey, nullptr, size, 0, param, false, version, shmBuf->id);
     }
     // Store URMA info for later use in SendBufferViaUb
     objInfo->ubUrmaDataInfo = urmaDataInfo;
@@ -2719,7 +2517,13 @@ Status ObjectClientImpl::ProcessShmPut(const std::string &objectKey, const uint8
     memoryRefCount_.IncreaseRef(shmBuf->id);
     RETURN_IF_NOT_OK(Buffer::CreateBuffer(objInfo, shared_from_this(), buffer));
 
-    RETURN_IF_NOT_OK(TimedMemoryCopyWithDeadline(buffer, data, size, traceEnabled));
+    // Copy user data into the shared memory buffer.
+    // no need call WLatch, the other thread cannot change before publish.
+    reqTimeoutDuration.Init(requestTimeoutMs_);
+    if (traceEnabled) {
+        Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_MEMORY_COPY_START);
+    }
+    RETURN_IF_NOT_OK(buffer->MemoryCopy(data, size));
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_MEMORY_COPY_END);
     }
@@ -2729,7 +2533,6 @@ Status ObjectClientImpl::ProcessShmPut(const std::string &objectKey, const uint8
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_START);
     }
-    failureStage = SetFailureStage::PUBLISH;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerApi->Publish(objInfo, !urmaDataInfo || objInfo->ubDataSentByMemoryCopy,
                                                          false, nestedObjectKeys, ttlSecond, existence),
                                      FormatString("Put object %s", objectKey));
@@ -2799,167 +2602,6 @@ Status ObjectClientImpl::Publish(const std::vector<std::shared_ptr<DeviceBuffer>
     return result;
 }
 
-Status ObjectClientImpl::SelectSetRoute(const std::string &objectKey,
-                                        const std::vector<HostPort> &excludedWorkers,
-                                        SetRouteContext &routeContext)
-{
-    SetRouteContext selected;
-    if (enableLocalCache_) {
-        RETURN_IF_NOT_OK(GetAvailableWorkerApi(selected.clientApi, selected.invokeGuard));
-        selected.worker = selected.clientApi->hostPort_;
-        selected.directWorkerApi = selected.clientApi;
-        routeContext = std::move(selected);
-        return Status::OK();
-    }
-    auto routing = std::atomic_load(&routing_);
-    RETURN_RUNTIME_ERROR_IF_NULL(routing);
-    HostPort worker;
-    RETURN_IF_NOT_OK(routing->SelectWorker(objectKey, dataPlacementPolicy_, worker, excludedWorkers));
-    return BuildSetRouteContext(worker, routeContext);
-}
-
-Status ObjectClientImpl::BuildSetRouteContext(const HostPort &worker, SetRouteContext &routeContext)
-{
-    SetRouteContext selected;
-    selected.worker = worker;
-    {
-        std::lock_guard<std::mutex> lock(switchNodeMutex_);
-        const auto node = currentNode_.load();
-        CHECK_FAIL_RETURN_STATUS(node < workerApi_.size() && workerApi_[node] != nullptr, K_NOT_READY,
-                                 "No client identity is available for routed Set");
-        selected.clientApi = workerApi_[node];
-        selected.clientApi->IncreaseInvokeCount();
-        selected.invokeGuard =
-            std::make_unique<Raii>([api = selected.clientApi]() { api->DecreaseInvokeCount(); });
-    }
-    if (selected.worker == selected.clientApi->hostPort_) {
-        selected.directWorkerApi = selected.clientApi;
-    }
-    routeContext = std::move(selected);
-    return Status::OK();
-}
-
-client::TransportRequestContext ObjectClientImpl::BuildTransportRequestContext(
-    const SetRouteContext &routeContext) const
-{
-    client::TransportRequestContext context;
-    context.clientId = routeContext.clientApi->clientId_;
-    const auto token = std::atomic_load(&transportToken_);
-    if (token != nullptr && !token->Empty()) {
-        context.token.assign(token->GetData(), token->GetSize());
-    }
-    const auto &requestTenantId = GetRequestContext()->tenantId;
-    context.tenantId = requestTenantId.empty() ? tenantId_ : requestTenantId;
-    return context;
-}
-
-Status ObjectClientImpl::ProcessTransportPut(
-    const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
-    const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence,
-    const SetRouteContext &routeContext, SetFailureStage &failureStage)
-{
-    RETURN_RUNTIME_ERROR_IF_NULL(transportLayer_);
-    const auto requestContext = BuildTransportRequestContext(routeContext);
-    client::TransportCreateParam createParam;
-    createParam.requestContext = requestContext;
-    createParam.cacheType = param.cacheType;
-    createParam.consistencyType = param.consistencyType;
-    createParam.writeMode = param.writeMode;
-    failureStage = SetFailureStage::CREATE;
-    std::shared_ptr<ObjectBuffer> buffer;
-    RETURN_IF_NOT_OK(transportLayer_->Create(routeContext.worker, objectKey, size, createParam, buffer));
-
-    failureStage = SetFailureStage::TRANSFER;
-    Status copyRc = buffer->MemoryCopy(data, size);
-    if (copyRc.IsError()) {
-        LOG_IF_ERROR(transportLayer_->Release(*buffer, requestContext),
-                     "Release routed Set allocation after MemoryCopy failure failed");
-        return copyRc;
-    }
-    client::TransportSetParam setParam;
-    setParam.requestContext = requestContext;
-    setParam.nestedKeys = nestedObjectKeys;
-    setParam.ttlSecond = ttlSecond;
-    setParam.existence = static_cast<ExistenceOpt>(existence);
-    failureStage = SetFailureStage::PUBLISH;
-    Status setRc = transportLayer_->Set(*buffer, setParam);
-    if (setRc.GetCode() == K_URMA_NEED_CONNECT) {
-        // TransportLayer returns this only after same-worker UB reconnect failed, before Publish was sent.
-        failureStage = SetFailureStage::TRANSFER;
-    }
-    return setRc;
-}
-
-bool ObjectClientImpl::HandleSetRouteFailure(const Status &status, SetFailureStage failureStage,
-                                             const HostPort &worker, std::vector<HostPort> &excludedWorkers)
-{
-    auto routing = std::atomic_load(&routing_);
-    if (routing == nullptr) {
-        return false;
-    }
-    if (status.GetCode() == K_SCALE_DOWN) {
-        if (std::find(excludedWorkers.begin(), excludedWorkers.end(), worker) == excludedWorkers.end()) {
-            excludedWorkers.emplace_back(worker);
-        }
-        return true;
-    }
-    const bool connectionFailure = status.GetCode() == K_CLIENT_WORKER_DISCONNECT
-                                   || status.GetCode() == K_RPC_UNAVAILABLE;
-    const bool transferFailure = status.GetCode() == K_URMA_NEED_CONNECT;
-    if (connectionFailure || transferFailure) {
-        routing->UpdateState(worker, K_CLIENT_WORKER_DISCONNECT);
-    }
-    // A Publish connection error is ambiguous. It must not be replayed on another worker.
-    return (failureStage == SetFailureStage::CREATE && connectionFailure)
-           || (failureStage == SetFailureStage::TRANSFER && transferFailure);
-}
-
-Status ObjectClientImpl::ExecuteSetFlow(
-    const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
-    const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence)
-{
-    std::vector<HostPort> excludedWorkers;
-    Status rc(K_RUNTIME_ERROR, "Set route attempts exhausted");
-    for (size_t attempt = 0; attempt < SET_ROUTE_MAX_ATTEMPTS; ++attempt) {
-        RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
-        SetRouteContext routeContext;
-        RETURN_IF_NOT_OK(SelectSetRoute(objectKey, excludedWorkers, routeContext));
-        VLOG(1) << FormatString("[Set] attempt: %zu, objectKey: %s, clientId: %s, worker: %s", attempt + 1,
-                                objectKey, routeContext.clientApi->clientId_, routeContext.worker.ToString());
-        SetFailureStage failureStage = SetFailureStage::CREATE;
-        if (routeContext.directWorkerApi != nullptr && routeContext.directWorkerApi->ShmCreateable(size)) {
-            rc = ProcessShmPut(objectKey, data, size, param, nestedObjectKeys, ttlSecond,
-                               routeContext.directWorkerApi, existence, failureStage);
-            if (rc.IsOk() || !HandleSetRouteFailure(rc, failureStage, routeContext.worker, excludedWorkers)) {
-                return rc;
-            }
-            continue;
-        }
-        if (routeContext.directWorkerApi != nullptr && transportLayer_ == nullptr) {
-            if (IsUrmaEnabled()) {
-                return ProcessShmPut(objectKey, data, size, param, nestedObjectKeys, ttlSecond,
-                                     routeContext.directWorkerApi, existence, failureStage);
-            }
-            auto info = MakeObjectBufferInfo(objectKey, const_cast<uint8_t *>(data), size, 0, param, false, 0);
-            const bool traceEnabled = ShouldCollectLatencyTrace(GetClientLatencyTraceConfig());
-            if (traceEnabled) {
-                Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_START);
-            }
-            rc = routeContext.directWorkerApi->Publish(info, false, false, nestedObjectKeys, ttlSecond, existence);
-            if (traceEnabled) {
-                Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_END);
-            }
-            return rc;
-        }
-        rc = ProcessTransportPut(objectKey, data, size, param, nestedObjectKeys, ttlSecond, existence,
-                                 routeContext, failureStage);
-        if (rc.IsOk() || !HandleSetRouteFailure(rc, failureStage, routeContext.worker, excludedWorkers)) {
-            return rc;
-        }
-    }
-    return rc;
-}
-
 Status ObjectClientImpl::Put(const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
                              const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence)
 {
@@ -2977,10 +2619,31 @@ Status ObjectClientImpl::Put(const std::string &objectKey, const uint8_t *data, 
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_SET_START);
     }
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
+    std::shared_ptr<IClientWorkerApi> workerApi;
+    std::unique_ptr<Raii> raii;
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
+
     Timer setTimer;
-    Status rc = ExecuteSetFlow(objectKey, data, size, param, nestedObjectKeys, ttlSecond, existence);
+    LOG(INFO) << FormatString("[Set] Begin, objectKey: %s, clientId: %s, worker: %s, path: %s", objectKey,
+                              workerApi->clientId_, workerApi->hostPort_.ToString(),
+                              workerApi->ShmCreateable(size) ? "SHM" : "UB");
+    bool isShm = workerApi->ShmCreateable(size);
+    Status rc;
+    if (isShm || IsUrmaEnabled()) {
+        rc = ProcessShmPut(objectKey, data, size, param, nestedObjectKeys, ttlSecond, workerApi, existence);
+    } else {
+        if (traceEnabled) {
+            Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_START);
+        }
+        auto objInfo = MakeObjectBufferInfo(objectKey, const_cast<uint8_t *>(data), size, 0, param, false, 0);
+        rc = workerApi->Publish(objInfo, isShm, false, nestedObjectKeys, ttlSecond, existence);
+        if (traceEnabled) {
+            Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_END);
+        }
+        if (rc.IsError()) {
+            LOG(ERROR) << FormatString("Put object %s failed: %s", objectKey, rc.ToString());
+        }
+    }
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_SET_END);
     }
@@ -3012,13 +2675,10 @@ static inline void RecordFailedPipelineKey(const std::string &key, std::shared_p
 
 std::vector<std::pair<std::string *, uint32_t>> ObjectClientImpl::PostProcessPipelineKeys(
     std::vector<std::string> &objectKeys, GetRspPb &rsp, PiplnRh2dParam &piplnRh2dParam, uint32_t version,
-    std::vector<std::string> &failedKeys)
+    std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedKeys)
 {
     std::vector<std::pair<std::string *, uint32_t>> needWaitKeysIds;
     std::shared_ptr<H2DChunkManager> chunkManager = piplnRh2dParam.chunkManager;
-    auto &buffers = piplnRh2dParam.buffers;
-    buffers.resize(objectKeys.size(), { nullptr });
-
     size_t i = 0;
     size_t j = 0;
     size_t shmCount = static_cast<size_t>(rsp.objects().size());
@@ -3028,7 +2688,7 @@ std::vector<std::pair<std::string *, uint32_t>> ObjectClientImpl::PostProcessPip
         uint32_t reqId;
         chunkManager->GetReqId(objectKey, reqId);
 
-        std::shared_ptr<Buffer> &buffer = buffers[index];
+        std::shared_ptr<Buffer> buffer = buffers[index];
         Status status;
         bool isShm = false;
         bool isNoShm = false;
@@ -3061,17 +2721,16 @@ std::vector<std::pair<std::string *, uint32_t>> ObjectClientImpl::PostProcessPip
         } else if (isNoShm) {
             j++;
             const GetRspPb::PayloadInfoPb &payloadInfo = rsp.payload_info(j);
-            METRIC_ADD(metrics::KvMetricId::CLIENT_GET_TCP_READ_TOTAL_BYTES,
-                       static_cast<uint64_t>(payloadInfo.data_size()));
             status = SetNonShmObjectBuffer(objectKey, payloadInfo, version, piplnRh2dParam.payloads, buffer);
             if (status.IsError()) {
                 PROCESS_FAILED_KEY("SetShmObjectBuffer failed");
             } else {
-                OsXprtPipln::ChunkTag tag{ .reqId = reqId,
-                                           .chunkType = OsXprtPipln::ChunkTag::lastChunkTag,
-                                           .chunkId = 0,
-                                           .chunkSize =
-                                               buffer->GetSize() > OsXprtPipln::ChunkTag::chunkSize2MB ? 1UL : 0UL };
+                OsXprtPipln::ChunkTag tag{
+                    .chunkType = OsXprtPipln::ChunkTag::lastChunkTag,
+                    .chunkId = 0,
+                    .chunkSize = buffer->GetSize() > OsXprtPipln::ChunkTag::chunkSize2MB ? 1UL : 0UL,
+                    .reqId = reqId,
+                };
                 chunkManager->DoPiplnStep2_ChunkConsume(reqId, reinterpret_cast<uint64_t>(buffer->ImmutableData()), tag,
                                                         buffer->GetSize());
                 chunkManager->MarkCancelOrDone(reqId, false /* isDone */);
@@ -3086,44 +2745,28 @@ std::vector<std::pair<std::string *, uint32_t>> ObjectClientImpl::PostProcessPip
 }
 
 Status ObjectClientImpl::PostPipelineRH2D(std::promise<AsyncResult> &promise, PiplnRh2dParam &piplnRh2dParam,
-                                          GetRspPb &rsp, std::vector<std::shared_ptr<Buffer>> &buffers)
+                                          GetRspPb &rsp)
 {
-    PerfPoint postPoint(PerfKey::PIPLN_RH2D_CLIENT_POST_PROCESS);
-    Timer postTimer;
     std::vector<std::string> failedKeys;
     auto &objectKeys = piplnRh2dParam.objectKeys;
     std::shared_ptr<H2DChunkManager> chunkManager = piplnRh2dParam.chunkManager;
     uint32_t version = piplnRh2dParam.version;
-    auto config = GetClientLatencyTraceConfig();
 
     Status recvRc(static_cast<StatusCode>(rsp.last_rc().error_code()), rsp.last_rc().error_msg());
 
     if (recvRc.IsError()) {
-        LOG(WARNING) << PIPLN_LOG_PREFIX "Pipeline failed, last error: " << recvRc.GetMsg();
+        LOG(WARNING) << "PipelineRH2D failed, last error: " << recvRc.GetMsg();
     }
 
     if (rsp.objects_size() == 0) {
         chunkManager->CancelAll();
-        const auto postUs = static_cast<uint64_t>(postTimer.ElapsedMicroSecond());
-        SLOW_LOG_IF_OR_VLOG(INFO, config.processSlowerThanUs > 0 && postUs >= config.processSlowerThanUs, 1,
-                            "[PIPLN RH2D] client post process done without object, objectCount: "
-                                << objectKeys.size() << ", costUs: " << postUs << ", status: " << recvRc.ToString());
-        buffers.clear();
         promise.set_value({ recvRc, objectKeys });
         return recvRc;
     }
 
-    auto needWaitKeysIds = PostProcessPipelineKeys(objectKeys, rsp, piplnRh2dParam, version, failedKeys);
-    {
-        PerfPoint waitPoint(PerfKey::PIPLN_RH2D_CLIENT_WAIT_DONE);
-        Timer waitTimer;
-        Status waitRc = chunkManager->WaitAll();
-        const auto waitUs = static_cast<uint64_t>(waitTimer.ElapsedMicroSecond());
-        SLOW_LOG_IF_OR_VLOG(INFO, config.processSlowerThanUs > 0 && waitUs >= config.processSlowerThanUs, 1,
-                            "[PIPLN RH2D] client wait done, objectCount: "
-                                << objectKeys.size() << ", waitKeyCount: " << needWaitKeysIds.size()
-                                << ", costUs: " << waitUs << ", status: " << waitRc.ToString());
-    }
+    std::vector<std::shared_ptr<Buffer>> buffers(rsp.objects_size(), nullptr);
+    auto needWaitKeysIds = PostProcessPipelineKeys(objectKeys, rsp, piplnRh2dParam, version, buffers, failedKeys);
+    chunkManager->WaitAll();
     for (auto keyIdPair : needWaitKeysIds) {
         if (!chunkManager->CheckIsRequestSuccess(keyIdPair.second)) {
             failedKeys.emplace_back(*keyIdPair.first);
@@ -3132,44 +2775,31 @@ Status ObjectClientImpl::PostPipelineRH2D(std::promise<AsyncResult> &promise, Pi
     if (recvRc.IsOk() && failedKeys.size()) {
         recvRc = Status(K_RUNTIME_ERROR, std::to_string(failedKeys.size()) + " keys failed");
     }
-    const auto postUs = static_cast<uint64_t>(postTimer.ElapsedMicroSecond());
-    SLOW_LOG_IF_OR_VLOG(INFO, config.processSlowerThanUs > 0 && postUs >= config.processSlowerThanUs, 1,
-                        "[PIPLN RH2D] client post process done, objectCount: "
-                            << objectKeys.size() << ", rspObjectCount: " << rsp.objects_size() << ", failedCount: "
-                            << failedKeys.size() << ", costUs: " << postUs << ", status: " << recvRc.ToString());
-    buffers = std::move(piplnRh2dParam.buffers);
     promise.set_value({ recvRc, failedKeys });
     return recvRc;
 }
 
 #else
 Status ObjectClientImpl::PostPipelineRH2D(std::promise<AsyncResult> &promise, PiplnRh2dParam &piplnRh2dParam,
-                                          GetRspPb &rsp, std::vector<std::shared_ptr<Buffer>> &buffers)
+                                          GetRspPb &rsp)
 {
     (void)promise;
     (void)piplnRh2dParam;
     (void)rsp;
-    (void)buffers;
     return Status::OK();
 }
 #endif
 
 Status ObjectClientImpl::CheckPipelineRH2DArgs(const std::vector<std::string> &objectKeys,
-                                               const std::vector<Blob> &devBlob,
-                                               std::shared_ptr<IClientWorkerApi> &workerApi)
+                                               const std::vector<std::pair<void *, size_t>> &devShmChunk,
+                                               std::shared_ptr<IClientWorkerApi> &workerApi, int64_t subTimeoutMs)
 {
     // check args
-    CHECK_FAIL_RETURN_STATUS(objectKeys.size() == devBlob.size(), K_INVALID,
-                             "objectKeys size is not equal to devBlob size");
+    CHECK_FAIL_RETURN_STATUS(objectKeys.size() == devShmChunk.size(), K_INVALID,
+                             "objectKeys size is not equal to devShmChunk size");
     CHECK_FAIL_RETURN_STATUS(Validator::IsBatchSizeUnderLimit(objectKeys.size()), K_INVALID,
                              FormatString("The objectKeys size exceed %d.", OBJECT_KEYS_MAX_SIZE_LIMIT));
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(objectKeys));
-    for (size_t i = 0; i < devBlob.size(); ++i) {
-        CHECK_FAIL_RETURN_STATUS(devBlob[i].pointer != nullptr, K_INVALID,
-                                 FormatString("device blob pointer is null, key index: %zu", i));
-        CHECK_FAIL_RETURN_STATUS(devBlob[i].size > 0, K_INVALID,
-                                 FormatString("device blob size is zero, key index: %zu", i));
-    }
 
     // client should be at same site with worker by shmem
     workerApi = workerApi_[LOCAL_WORKER];
@@ -3179,6 +2809,10 @@ Status ObjectClientImpl::CheckPipelineRH2DArgs(const std::vector<std::string> &o
                              "not support pipeline rh2d: shared memory is not enabled");
     CHECK_FAIL_RETURN_STATUS(workerApi->WorkerSupportPiplnRH2D(), K_NOT_SUPPORTED, "worker don't enable pipeline rh2d");
 
+    CHECK_FAIL_RETURN_STATUS(
+        Validator::IsInNonNegativeInt32(subTimeoutMs), K_INVALID,
+        FormatString("subTimeoutMs %lld is out of range, which should be between[%d, %d]", subTimeoutMs, 0, INT32_MAX));
+
     // check connection
     RETURN_IF_NOT_OK(IsClientReady());
     RETURN_IF_NOT_OK(CheckConnection());
@@ -3186,18 +2820,18 @@ Status ObjectClientImpl::CheckPipelineRH2DArgs(const std::vector<std::string> &o
 }
 
 std::shared_future<AsyncResult> ObjectClientImpl::GetWithOsTransportPipeline(
-    const std::vector<std::string> &objectKeys, const std::vector<Blob> &devBlob,
-    std::vector<std::shared_ptr<Buffer>> &buffers, void *h2dStream)
+    const std::vector<std::string> &objectKeys, const std::vector<std::pair<void *, size_t>> &devShmChunk,
+    int64_t subTimeoutMs)
 {
     auto asyncResource = std::make_shared<PipelineAsyncResource>();
     std::shared_future<AsyncResult> future = asyncResource->promise.get_future().share();
 
 #ifdef BUILD_PIPLN_H2D
-    PerfPoint perfPoint(PerfKey::PIPLN_RH2D_CLIENT_SUBMIT);
+    PerfPoint perfPoint(PerfKey::CLIENT_GET_WITH_OS_XPRT_PIPLINE);
 
     // check status
     std::shared_ptr<IClientWorkerApi> workerApi;
-    Status rc = CheckPipelineRH2DArgs(objectKeys, devBlob, workerApi);
+    Status rc = CheckPipelineRH2DArgs(objectKeys, devShmChunk, workerApi, subTimeoutMs);
     if (rc.IsError()) {
         if (workerApi) {
             workerApi->DecreaseInvokeCount();
@@ -3211,39 +2845,20 @@ std::shared_future<AsyncResult> ObjectClientImpl::GetWithOsTransportPipeline(
     std::vector<OsXprtPipln::DevShmInfo> devInfos;
     for (size_t i = 0; i < objectKeys.size(); i++) {
         devInfos.emplace_back(OsXprtPipln::DevShmInfo{ OsXprtPipln::TargetDeviceType::CUDA, (uint32_t)-1,
-                                                       devBlob[i].pointer, static_cast<size_t>(devBlob[i].size),
-                                                       h2dStream });
+                                                       devShmChunk[i].first, devShmChunk[i].second });
     }
     asyncResource->piplnRh2dParam =
-        PiplnRh2dParam{ .requestTimeoutMs = requestTimeoutMs_,
+        PiplnRh2dParam{ .subTimeoutMs = subTimeoutMs,
                         .objectKeys = objectKeys,
                         .devInfos = std::move(devInfos),
                         .chunkManager = std::make_shared<H2DChunkManager>(true /* isClient */),
                         .version = 0 };
 
     auto traceContext = Trace::Instance().GetContext();
-    int64_t apiRemainingUs = ApiDeadline::Instance().ApiRemainingUs();
-    if (apiRemainingUs <= 0) {
-        Status rc(K_RPC_DEADLINE_EXCEEDED,
-                  FormatString("API deadline exceeded before PipelineRH2D dispatch, remaining %ld us.",
-                               apiRemainingUs));
-        asyncResource->promise.set_value({ rc, objectKeys });
-        LOG(ERROR) << rc.GetMsg();
-        return future;
-    }
-    auto dispatchTime = std::chrono::steady_clock::now();
-    asyncResource->rpcFuture = asyncGetRPCPool_->Submit(
-        [this, asyncResource, traceContext, workerApi, apiRemainingUs, dispatchTime, &buffers]() {
+    asyncResource->rpcFuture = asyncGetRPCPool_->Submit([this, asyncResource, traceContext, workerApi]() {
         TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
-        ApiDeadline::Instance().Push();
-        Raii deadlineRaii([]() { ApiDeadline::Instance().Pop(); });
         std::unique_ptr<Raii> raii = std::make_unique<Raii>([workerApi]() { workerApi->DecreaseInvokeCount(); });
-        auto initRc = InitTimeoutsFromDispatch(apiRemainingUs, dispatchTime);
-        if (initRc.IsError()) {
-            asyncResource->promise.set_value({ initRc, asyncResource->piplnRh2dParam.objectKeys });
-            LOG(ERROR) << initRc.GetMsg();
-            return initRc;
-        }
+        datasystem::reqTimeoutDuration.InitWithPositiveTime(asyncResource->piplnRh2dParam.subTimeoutMs);
 
         // do RH2D
         GetRspPb getRsp;
@@ -3252,14 +2867,13 @@ std::shared_future<AsyncResult> ObjectClientImpl::GetWithOsTransportPipeline(
             asyncResource->promise.set_value({ ret, asyncResource->piplnRh2dParam.objectKeys });
             return ret;
         }
-        return PostPipelineRH2D(asyncResource->promise, asyncResource->piplnRh2dParam, getRsp, buffers);
+        return PostPipelineRH2D(asyncResource->promise, asyncResource->piplnRh2dParam, getRsp);
     });
     perfPoint.Record();
 #else
-    (void)devBlob;
-    (void)h2dStream;
+    (void)devShmChunk;
+    (void)subTimeoutMs;
     asyncResource->promise.set_value({ Status(K_NOT_SUPPORTED, "not build with BUILD_PIPLN_H2D"), objectKeys });
-    (void)buffers;
 #endif
     return future;
 }
@@ -3286,159 +2900,6 @@ Status ObjectClientImpl::GetWithLatch(const std::vector<std::string> &objectKeys
     return rc;
 }
 
-void ObjectClientImpl::BuildTransportReadRequest(const std::vector<std::string> &objectKeys,
-                                                 client::ObjectReadRequest &request,
-                                                 std::vector<Status> &itemStatuses) const
-{
-    auto routing = std::atomic_load(&routing_);
-    if (routing == nullptr) {
-        std::fill(itemStatuses.begin(), itemStatuses.end(), Status(K_NOT_READY, "Object route is not ready"));
-        return;
-    }
-    std::unordered_map<HostPort, std::vector<std::string>> groupedKeys;
-    Status routeStatus =
-        routing->SelectWorkers(objectKeys, client::DataPlacementPolicy::PREFERRED_META_OWNER, groupedKeys);
-    if (routeStatus.IsError()) {
-        std::fill(itemStatuses.begin(), itemStatuses.end(), routeStatus);
-        return;
-    }
-    std::unordered_map<std::string, HostPort> metaOwners;
-    metaOwners.reserve(objectKeys.size());
-    for (const auto &group : groupedKeys) {
-        for (const auto &key : group.second) {
-            metaOwners.emplace(key, group.first);
-        }
-    }
-    for (size_t i = 0; i < objectKeys.size(); ++i) {
-        auto owner = metaOwners.find(objectKeys[i]);
-        if (owner == metaOwners.end()) {
-            itemStatuses[i] = Status(K_RUNTIME_ERROR, "Batch route result is incomplete");
-            continue;
-        }
-        itemStatuses[i] = Status::OK();
-        request.items.push_back({ i, objectKeys[i], owner->second });
-    }
-}
-
-Status ObjectClientImpl::MaterializeTransportItem(const std::string &objectKey, client::ObjectReadItemResult &item,
-                                                  std::shared_ptr<Buffer> &buffer)
-{
-    CHECK_FAIL_RETURN_STATUS(item.objectKey == objectKey, K_RUNTIME_ERROR, "Invalid object data response");
-    auto &data = item.data;
-    const uint64_t dataSize = data.externalOwner != nullptr
-                                  ? data.externalSize
-                                  : static_cast<uint64_t>(std::max<int64_t>(data.response.data_size(), 0));
-    GetRspPb response;
-    auto *payloadInfo = response.add_payload_info();
-    payloadInfo->set_object_key(item.objectKey);
-    payloadInfo->set_object_index(0);
-    payloadInfo->set_data_size(static_cast<int64_t>(dataSize));
-    std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>> ubBufferInfos;
-    if (data.externalOwner != nullptr) {
-        CHECK_FAIL_RETURN_STATUS(data.response.data_size() >= 0
-                                     && static_cast<uint64_t>(data.response.data_size()) == data.externalSize,
-                                 K_RUNTIME_ERROR, "Invalid object data response");
-        CHECK_FAIL_RETURN_STATUS(data.externalData != nullptr || dataSize == 0, K_RUNTIME_ERROR,
-                                 "Invalid object data response");
-        FullParam param;
-        auto bufferInfo = MakeObjectBufferInfo(item.objectKey,
-                                               const_cast<uint8_t *>(data.externalData), dataSize, 0, param, false, 0);
-        bufferInfo->ubGetBufferHandle = data.externalOwner;
-        ubBufferInfos.emplace(item.objectKey, std::move(bufferInfo));
-        payloadInfo->add_part_index(0);
-        data.rpcPayloads.emplace_back();
-    } else {
-        CHECK_FAIL_RETURN_STATUS(data.externalData == nullptr && data.externalSize == 0, K_RUNTIME_ERROR,
-                                 "Invalid object data response");
-        uint64_t payloadSize = 0;
-        for (size_t i = 0; i < data.rpcPayloads.size(); ++i) {
-            CHECK_FAIL_RETURN_STATUS(payloadSize <= UINT64_MAX - data.rpcPayloads[i].Size(), K_RUNTIME_ERROR,
-                                     "Invalid object data response");
-            payloadSize += data.rpcPayloads[i].Size();
-            payloadInfo->add_part_index(static_cast<uint32_t>(i));
-        }
-        CHECK_FAIL_RETURN_STATUS(payloadSize == dataSize, K_RUNTIME_ERROR, "Invalid object data response");
-    }
-    std::vector<std::shared_ptr<Buffer>> itemBuffers(1);
-    std::vector<std::string> failedKeys;
-    RETURN_IF_NOT_OK(ProcessGetResponse({ item.objectKey }, {}, response, 0, data.rpcPayloads, itemBuffers, failedKeys,
-                                        ubBufferInfos));
-    CHECK_FAIL_RETURN_STATUS(failedKeys.empty() && itemBuffers.front() != nullptr, K_NOT_FOUND,
-                             "Cannot get objects from worker");
-    buffer = std::move(itemBuffers.front());
-    return Status::OK();
-}
-
-Status ObjectClientImpl::ApplyTransportReadResult(const std::vector<std::string> &objectKeys,
-                                                  const client::ObjectReadRequest &request,
-                                                  client::ObjectReadResult &result, const Status &transportStatus,
-                                                  std::vector<std::shared_ptr<Buffer>> &buffers,
-                                                  std::vector<Status> &itemStatuses,
-                                                  AccessTransportKind &actualKind)
-{
-    std::vector<bool> returned(objectKeys.size(), false);
-    for (auto &item : result.items) {
-        CHECK_FAIL_RETURN_STATUS(item.requestIndex < objectKeys.size(), K_RUNTIME_ERROR,
-                                 "Invalid response while getting objects");
-        CHECK_FAIL_RETURN_STATUS(!returned[item.requestIndex], K_RUNTIME_ERROR,
-                                 "Invalid response while getting objects");
-        CHECK_FAIL_RETURN_STATUS(item.objectKey == objectKeys[item.requestIndex], K_RUNTIME_ERROR,
-                                 "Invalid response while getting objects");
-        returned[item.requestIndex] = true;
-        itemStatuses[item.requestIndex] = item.status;
-        if (item.status.IsOk()) {
-            itemStatuses[item.requestIndex] =
-                MaterializeTransportItem(item.objectKey, item, buffers[item.requestIndex]);
-            if (itemStatuses[item.requestIndex].IsOk()) {
-                actualKind = static_cast<AccessTransportKind>(std::max(
-                    static_cast<uint8_t>(actualKind), static_cast<uint8_t>(item.data.kind)));
-            }
-        }
-    }
-    for (const auto &item : request.items) {
-        if (!returned[item.requestIndex]) {
-            itemStatuses[item.requestIndex] = transportStatus.IsError()
-                                                  ? transportStatus
-                                                  : Status(K_RUNTIME_ERROR, "Cannot get objects from worker");
-        }
-    }
-    return Status::OK();
-}
-
-Status ObjectClientImpl::FinishTransportRead(const std::vector<Status> &itemStatuses,
-                                             AccessTransportKind actualKind, const Status &transportStatus)
-{
-    if (std::any_of(itemStatuses.begin(), itemStatuses.end(), [](const Status &status) { return status.IsOk(); })) {
-        AccessTransportTracker::Record(actualKind);
-        return Status::OK();
-    }
-    for (const auto &status : itemStatuses) {
-        if (status.IsError()) {
-            return status;
-        }
-    }
-    return transportStatus.IsError() ? transportStatus : Status(K_RUNTIME_ERROR, "Failed to get objects");
-}
-
-Status ObjectClientImpl::GetFromTransportLayer(const std::vector<std::string> &objectKeys,
-                                               std::vector<std::shared_ptr<Buffer>> &buffers)
-{
-    CHECK_FAIL_RETURN_STATUS(transportLayer_ != nullptr, K_NOT_READY, "Object service is not ready");
-    CHECK_FAIL_RETURN_STATUS(objectKeys.size() == buffers.size(), K_RUNTIME_ERROR,
-                             "Failed to prepare object Get request");
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    client::ObjectReadRequest request;
-    std::vector<Status> itemStatuses(objectKeys.size(), Status(K_NOT_READY, "Object Get has not completed"));
-    BuildTransportReadRequest(objectKeys, request, itemStatuses);
-    client::ObjectReadResult result;
-    Status transportStatus = request.items.empty() ? Status(K_NOT_READY, "No object route is available")
-                                                   : transportLayer_->Get(request, result);
-    AccessTransportKind actualKind = AccessTransportKind::SHM;
-    RETURN_IF_NOT_OK(ApplyTransportReadResult(objectKeys, request, result, transportStatus, buffers, itemStatuses,
-                                              actualKind));
-    return FinishTransportRead(itemStatuses, actualKind, transportStatus);
-}
-
 Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t subTimeoutMs,
                              std::vector<Optional<Buffer>> &buffers, bool queryL2Cache, bool isRH2DSupported)
 {
@@ -3453,23 +2914,16 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_GET_START);
     }
+    std::shared_ptr<IClientWorkerApi> workerApi;
+    std::unique_ptr<Raii> raii;
+    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
     std::vector<std::shared_ptr<Buffer>> objectBuffers(objectKeys.size());
-    Status rc;
-    if (!enableLocalCache_) {
-        CHECK_FAIL_RETURN_STATUS(!isRH2DSupported, K_NOT_SUPPORTED,
-                                 "Remote H2D is not supported when local cache is disabled");
-        rc = GetFromTransportLayer(objectKeys, objectBuffers);
-    } else {
-        std::shared_ptr<IClientWorkerApi> workerApi;
-        std::unique_ptr<Raii> raii;
-        RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
-        GetParam getParam{ .objectKeys = objectKeys,
-                           .subTimeoutMs = subTimeoutMs,
-                           .readParams = {},
-                           .queryL2Cache = queryL2Cache,
-                           .isRH2DSupported = isRH2DSupported };
-        rc = GetBuffersFromWorker(workerApi, getParam, objectBuffers);
-    }
+    GetParam getParam{ .objectKeys = objectKeys,
+                       .subTimeoutMs = subTimeoutMs,
+                       .readParams = {},
+                       .queryL2Cache = queryL2Cache,
+                       .isRH2DSupported = isRH2DSupported };
+    Status rc = GetBuffersFromWorker(workerApi, getParam, objectBuffers);
     buffers.clear();
     for (auto &objectBuffer : objectBuffers) {
         if (objectBuffer == nullptr) {
@@ -3611,39 +3065,23 @@ Status ObjectClientImpl::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> 
     getParam.actualTransportKind = nullptr;
     auto config = GetClientLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
 
 #ifdef USE_URMA
-    // Happy path: use pre-configured data size to skip GetObjMetaInfo RPC.
-    constexpr int BASE_DECIMAL = 10;
-    uint64_t configuredUbSize = 0;
-    {
-        const char *envUbGetSize = std::getenv("DATASYSTEM_UB_GET_DATA_SIZE_BYTES");
-        if (envUbGetSize != nullptr && envUbGetSize[0] != '\0') {
-            configuredUbSize = std::strtoull(envUbGetSize, nullptr, BASE_DECIMAL);
-        }
-    }
-    if (configuredUbSize > 0) {
-        getParam.ubTotalSize = configuredUbSize;
-        getParam.ubMetaResolved = true;
-        getParam.ubGetObjMetaElapsedMs = 0;
-        getParam.actualTransportKind = &actualTransportKind;
-    }
-
     // For UB mode, pre-fetch object sizes via GetObjMetaInfo and split into batches if needed.
     if (IsUrmaEnabled() && workerApi != nullptr && !workerApi->IsShmEnable()
-        && !(getParam.isRH2DSupported && IsRemoteH2DEnabled()) && configuredUbSize == 0) {
+        && !(getParam.isRH2DSupported && IsRemoteH2DEnabled())) {
         shouldRecordTransport = true;
         std::vector<ObjMetaInfo> objMetas;
-        std::string tenantId = GetRequestContext()->tenantId.empty() ? tenantId_ : GetRequestContext()->tenantId;
+        std::string tenantId = g_ContextTenantId.empty() ? tenantId_ : g_ContextTenantId;
         Timer metaTimer;
         Status metaRc = workerApi->GetObjMetaInfo(tenantId, objectsNeedToGet, objMetas);
         getParam.ubGetObjMetaElapsedMs = static_cast<int64_t>(metaTimer.ElapsedMilliSecond());
         getParam.ubMetaResolved = true;
-        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(metaRc, "GetObjMetaInfo failed before UB get");
-        if (objMetas.size() != objectsNeedToGet.size()) {
-            LOG(WARNING) << "GetObjMetaInfo size mismatch, expected " << objectsNeedToGet.size()
-                         << " but got " << objMetas.size() << ", fallback to TCP/IP payload before get.";
+        if (metaRc.IsError()) {
+            RETURN_IF_NOT_OK_PRINT_ERROR_MSG(metaRc, "GetObjMetaInfo failed before UB get");
+        } else if (objMetas.size() != objectsNeedToGet.size()) {
+            LOG(WARNING) << "GetObjMetaInfo object count mismatch: expected " << objectsNeedToGet.size() << " but got "
+                         << objMetas.size() << ", fallback to TCP/IP payload before get.";
             actualTransportKind = AccessTransportKind::TCP;
         } else {
             uint64_t ubMaxGetSize = UrmaManager::Instance().GetUBMaxGetDataSize();
@@ -3652,11 +3090,11 @@ Status ObjectClientImpl::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> 
                 totalSize += meta.objSize;
             }
             if (totalSize <= ubMaxGetSize) {
-                // common case: everything fits in one buffer.
+                // common case: everything fits in one buffer. Pass total batch size and perform a single Get.
                 getParam.ubTotalSize = totalSize;
                 getParam.actualTransportKind = &actualTransportKind;
             } else {
-                // batch special case: total size exceeds buffer limit.
+                // batch special case: total size exceeds buffer limit. Split into sub-batches.
                 Status batchRc = GetBuffersFromWorkerBatched(workerApi, getParam, buffers, objMetas, ubMaxGetSize,
                                                              &actualTransportKind);
                 AccessTransportTracker::Record(actualTransportKind);
@@ -3782,6 +3220,8 @@ static std::vector<UBGetBatch> BuildUBGetBatches(const std::vector<ObjMetaInfo> 
                 batches.push_back(std::move(currentBatch));
                 currentBatch = UBGetBatch{};
             }
+            // Oversized key gets its own TCP-only batch.
+            // Pass actual size so PrepareUrmaBuffer rejects it without a redundant GetObjMetaInfo RPC.
             UBGetBatch tcpBatch;
             tcpBatch.indices.push_back(i);
             tcpBatch.totalSize = objSize;
@@ -3821,19 +3261,6 @@ Status ObjectClientImpl::GetBuffersFromWorkerBatched(std::shared_ptr<IClientWork
     Status lastError;
 
     for (const auto &batch : batches) {
-        if (batch.indices.size() == 1 && objMetas[batch.indices[0]].objSize > ubMaxGetSize) {
-            const size_t idx = batch.indices[0];
-            Status rc = GetOversizedBufferFromWorkerByChunks(workerApi, getParam, idx, objMetas[idx].objSize,
-                                                             ubMaxGetSize, buffers[idx], requestTransportKind);
-            if (rc.IsError()) {
-                LOG(WARNING) << "Chunked Get failed for " << objectKeys[idx] << ": " << rc.ToString();
-                lastError = rc;
-                continue;
-            }
-            totalSuccessCount++;
-            continue;
-        }
-
         std::vector<std::string> subKeys;
         subKeys.reserve(batch.indices.size());
         for (size_t idx : batch.indices) {
@@ -3898,113 +3325,6 @@ Status ObjectClientImpl::GetBuffersFromWorkerBatched(std::shared_ptr<IClientWork
     }
     totalPoint.Record();
     return lastError.IsOk() ? Status(K_NOT_FOUND, "Cannot get objects from worker") : lastError;
-}
-
-Status ObjectClientImpl::GetOversizedBufferFromWorkerByChunks(std::shared_ptr<IClientWorkerApi> workerApi,
-                                                              const GetParam &getParam, size_t objectIndex,
-                                                              uint64_t objectSize, uint64_t ubMaxGetSize,
-                                                              std::shared_ptr<Buffer> &buffer,
-                                                              AccessTransportKind *requestTransportKind)
-{
-    CHECK_FAIL_RETURN_STATUS(ubMaxGetSize > 0, K_INVALID, "UB max get size is 0");
-    const auto &objectKey = getParam.objectKeys[objectIndex];
-    OffsetInfo offsetInfo;
-    if (!getParam.readParams.empty()) {
-        CHECK_FAIL_RETURN_STATUS(
-            objectIndex < getParam.readParams.size(), K_INVALID,
-            FormatString("Read parameter index %zu is out of range %zu", objectIndex, getParam.readParams.size()));
-        offsetInfo = OffsetInfo(getParam.readParams[objectIndex].offset, getParam.readParams[objectIndex].size);
-    } else {
-        offsetInfo = OffsetInfo(0, objectSize);
-    }
-    offsetInfo.AdjustReadSize(objectSize);
-    FullParam param;
-    auto bufferInfo = MakeObjectBufferInfo(objectKey, nullptr, offsetInfo.readSize, 0, param, false, 0);
-    std::shared_ptr<Buffer> mergedBuffer;
-    RETURN_IF_NOT_OK(Buffer::CreateBuffer(std::move(bufferInfo), shared_from_this(), mergedBuffer));
-
-    uint64_t copiedSize = 0;
-    uint32_t firstVersion = 0;
-    bool hasVersion = false;
-    while (copiedSize < offsetInfo.readSize) {
-        uint64_t chunkSize = std::min(ubMaxGetSize, offsetInfo.readSize - copiedSize);
-        std::shared_ptr<Buffer> chunkBuffer;
-        uint32_t chunkVersion = 0;
-        RETURN_IF_NOT_OK(GetOversizedBufferChunk(workerApi, getParam, objectKey, offsetInfo.readOffset + copiedSize,
-                                                 chunkSize, chunkBuffer, chunkVersion, requestTransportKind));
-        if (!hasVersion) {
-            firstVersion = chunkVersion;
-            hasVersion = true;
-        } else {
-            CHECK_FAIL_RETURN_STATUS(firstVersion == chunkVersion, K_RUNTIME_ERROR,
-                                     FormatString("Object %s version changed during chunked Get, first %u, current %u",
-                                                  objectKey, firstVersion, chunkVersion));
-        }
-        uint64_t realChunkSize = 0;
-        RETURN_IF_NOT_OK(CopyOversizedBufferChunk(objectKey, offsetInfo.readSize, copiedSize, chunkBuffer, mergedBuffer,
-                                                  realChunkSize));
-        copiedSize += realChunkSize;
-    }
-    GetBufferInfo(mergedBuffer)->version = firstVersion;
-    buffer = std::move(mergedBuffer);
-    return Status::OK();
-}
-
-Status ObjectClientImpl::GetOversizedBufferChunk(std::shared_ptr<IClientWorkerApi> workerApi, const GetParam &getParam,
-                                                 const std::string &objectKey, uint64_t offset, uint64_t chunkSize,
-                                                 std::shared_ptr<Buffer> &chunkBuffer, uint32_t &version,
-                                                 AccessTransportKind *requestTransportKind)
-{
-    ReadParam readParam{ objectKey, offset, chunkSize };
-    std::vector<std::string> subKeys{ objectKey };
-    std::vector<ReadParam> subReadParams{ readParam };
-    AccessTransportKind chunkTransportKind = AccessTransportKind::SHM;
-    GetParam subGetParam{ .objectKeys = subKeys,
-                          .subTimeoutMs = getParam.subTimeoutMs,
-                          .readParams = subReadParams,
-                          .queryL2Cache = getParam.queryL2Cache,
-                          .isRH2DSupported = getParam.isRH2DSupported,
-                          .ubTotalSize = chunkSize,
-                          .ubMetaResolved = true,
-                          .ubGetObjMetaElapsedMs = getParam.ubGetObjMetaElapsedMs,
-                          .actualTransportKind = &chunkTransportKind };
-    GetRspPb rsp;
-    std::vector<RpcMessage> payloads;
-    RETURN_IF_NOT_OK(workerApi->Get(subGetParam, version, rsp, payloads));
-    if (requestTransportKind != nullptr) {
-        *requestTransportKind = MergeTransportKind(*requestTransportKind, chunkTransportKind);
-    }
-
-    std::vector<std::shared_ptr<Buffer>> chunkBuffers(1);
-    std::vector<std::string> failedObjectKey;
-    RETURN_IF_NOT_OK(ProcessGetResponse(subKeys, subReadParams, rsp, version, payloads, chunkBuffers,
-                                        failedObjectKey));
-    CHECK_FAIL_RETURN_STATUS(failedObjectKey.empty() && chunkBuffers[0] != nullptr, K_NOT_FOUND,
-                             FormatString("Cannot get chunk of object %s, offset %zu, size %zu", objectKey, offset,
-                                          chunkSize));
-    chunkBuffer = std::move(chunkBuffers[0]);
-    return Status::OK();
-}
-
-Status ObjectClientImpl::CopyOversizedBufferChunk(const std::string &objectKey, uint64_t objectSize, uint64_t offset,
-                                                  const std::shared_ptr<Buffer> &chunkBuffer,
-                                                  std::shared_ptr<Buffer> &buffer, uint64_t &copiedSize)
-{
-    auto chunkBufferSize = chunkBuffer->GetSize();
-    CHECK_FAIL_RETURN_STATUS(chunkBufferSize >= 0, K_RUNTIME_ERROR,
-                             FormatString("Chunk size is negative for object %s", objectKey));
-    uint64_t realChunkSize = static_cast<uint64_t>(chunkBufferSize);
-    CHECK_FAIL_RETURN_STATUS(realChunkSize > 0, K_RUNTIME_ERROR,
-                             FormatString("Chunk size is zero for object %s, offset %zu", objectKey, offset));
-    CHECK_FAIL_RETURN_STATUS(realChunkSize <= objectSize - offset, K_RUNTIME_ERROR,
-                             FormatString("Chunk size %zu overflows object %s remaining size %zu", realChunkSize,
-                                          objectKey, objectSize - offset));
-    RETURN_IF_NOT_OK(::datasystem::MemoryCopy(static_cast<uint8_t *>(buffer->MutableData()) + offset,
-                                              objectSize - offset,
-                                              static_cast<const uint8_t *>(chunkBuffer->ImmutableData()),
-                                              realChunkSize, memoryCopyThreadPool_));
-    copiedSize = realChunkSize;
-    return Status::OK();
 }
 #endif
 
@@ -4075,10 +3395,21 @@ Status ObjectClientImpl::GetObjectBuffers(const std::vector<std::string> &object
                 failedObjectKey.emplace_back(objectKey);
                 continue;
             }
-            status = SetShmObjectBufferWithMetric(objectKey, info, version, readParams, index, bufferPtr);
+            // Special case for Remote H2D scenario.
+            if (info.has_host_info()) {
+                status = SetRemoteHostObjectBuffer(objectKey, info, version, bufferPtr);
+            } else if (readParams.empty()) {
+                status = SetShmObjectBuffer(objectKey, info, version, bufferPtr);
+            } else {
+                status = SetOffsetReadObjectBuffer(objectKey, info, version, readParams[index].offset,
+                                                   readParams[index].size, bufferPtr);
+            }
         } else if (isNoShm) {
-            status = SetNoShmObjectBufferWithMetric(objectKey, rsp.payload_info(j), version, payloads,
-                                                    ubBufferInfos, bufferPtr);
+            const GetRspPb::PayloadInfoPb &payloadInfo = rsp.payload_info(j);
+            auto it = ubBufferInfos.find(objectKey);
+            status = (it != ubBufferInfos.end())
+                ? Buffer::CreateBuffer(it->second, shared_from_this(), bufferPtr)
+                : SetNonShmObjectBuffer(objectKey, payloadInfo, version, payloads, bufferPtr);
             j++;
         } else {
             RETURN_STATUS(K_UNKNOWN_ERROR, "Object key does not match with GetRspPb");
@@ -4091,47 +3422,6 @@ Status ObjectClientImpl::GetObjectBuffers(const std::vector<std::string> &object
         }
     }
     return Status::OK();
-}
-
-Status ObjectClientImpl::SetShmObjectBufferWithMetric(const std::string &objectKey,
-                                                      const GetRspPb::ObjectInfoPb &info, uint32_t version,
-                                                      const std::vector<ReadParam> &readParams, size_t index,
-                                                      std::shared_ptr<Buffer> &bufferPtr)
-{
-    // Special case for Remote H2D scenario.
-    if (info.has_host_info()) {
-        return SetRemoteHostObjectBuffer(objectKey, info, version, bufferPtr);
-    }
-    if (readParams.empty()) {
-        METRIC_ADD(metrics::KvMetricId::CLIENT_GET_SHM_READ_TOTAL_BYTES,
-                   static_cast<uint64_t>(info.data_size()));
-        return SetShmObjectBuffer(objectKey, info, version, bufferPtr);
-    }
-    uint64_t dataSize = static_cast<uint64_t>(info.data_size());
-    OffsetInfo offsetInfo(readParams[index].offset, readParams[index].size);
-    offsetInfo.AdjustReadSize(dataSize);
-    if (offsetInfo.readSize > 0) {
-        METRIC_ADD(metrics::KvMetricId::CLIENT_GET_SHM_READ_TOTAL_BYTES, offsetInfo.readSize);
-    }
-    return SetOffsetReadObjectBuffer(objectKey, info, version, readParams[index].offset,
-                                     readParams[index].size, bufferPtr);
-}
-
-Status ObjectClientImpl::SetNoShmObjectBufferWithMetric(const std::string &objectKey,
-                                                        const GetRspPb::PayloadInfoPb &payloadInfo,
-                                                        uint32_t version, std::vector<RpcMessage> &payloads,
-                                                        const std::unordered_map<std::string,
-                                                            std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos,
-                                                        std::shared_ptr<Buffer> &bufferPtr)
-{
-    uint64_t dataSize = static_cast<uint64_t>(payloadInfo.data_size());
-    auto it = ubBufferInfos.find(objectKey);
-    if (it != ubBufferInfos.end()) {
-        METRIC_ADD(metrics::KvMetricId::CLIENT_GET_URMA_READ_TOTAL_BYTES, dataSize);
-        return Buffer::CreateBuffer(it->second, shared_from_this(), bufferPtr);
-    }
-    METRIC_ADD(metrics::KvMetricId::CLIENT_GET_TCP_READ_TOTAL_BYTES, dataSize);
-    return SetNonShmObjectBuffer(objectKey, payloadInfo, version, payloads, bufferPtr);
 }
 
 Status ObjectClientImpl::SetRemoteHostObjectBuffer(const std::string &objectKey, const GetRspPb::ObjectInfoPb &info,
@@ -4252,15 +3542,6 @@ Status ObjectClientImpl::GIncreaseRef(const std::vector<std::string> &objectKeys
                                  "The remoteClientId contains illegal char(s).");
         auto rc = workerApi_[LOCAL_WORKER]->GIncreaseWorkerRef(objectKeys, failedObjectKeys, remoteClientId);
         VLOG(1) << "[Ref] Global ref count GIncreaseRef end" << VectorToString(objectKeys);
-        if (!failedObjectKeys.empty()) {
-            std::unordered_set<std::string> requestedObjectKeys;
-            requestedObjectKeys.reserve(objectKeys.size());
-            (void)requestedObjectKeys.insert(objectKeys.begin(), objectKeys.end());
-            std::unordered_set<std::string> failedObjectKeySet;
-            failedObjectKeySet.reserve(failedObjectKeys.size());
-            (void)failedObjectKeySet.insert(failedObjectKeys.begin(), failedObjectKeys.end());
-            return requestedObjectKeys.size() > failedObjectKeySet.size() ? Status::OK() : rc;
-        }
         return rc;
     }
 
@@ -4303,13 +3584,13 @@ std::string ObjectClientImpl::ConstructObjKeyWithTenantId(const std::string &obj
     std::string tenantId;
     if (!token_.Empty()) {
         tenantId = "";
-    } else if (GetRequestContext()->tenantId.empty()) {
+    } else if (g_ContextTenantId.empty()) {
         tenantId = tenantId_;
     } else {
-        tenantId = GetRequestContext()->tenantId;
+        tenantId = g_ContextTenantId;
     }
     if (!tenantId.empty()) {
-        objKeyWithTenant = GetRequestContext()->tenantId + K_SEPARATOR + objKey;
+        objKeyWithTenant = g_ContextTenantId + K_SEPARATOR + objKey;
     }
     return objKeyWithTenant;
 }
@@ -4438,9 +3719,9 @@ void ObjectClientImpl::GDecreaseRefRollback(const std::vector<std::string> &roll
 Status ObjectClientImpl::CheckValidObjectKey(const std::string &key)
 {
     CHECK_FAIL_RETURN_STATUS(Validator::IsIdFormat(key), K_INVALID,
-        FormatString("The key contains illegal char(s), allowed regex format: %s "
-                     "or the length of key must be no more than %u. Current key: %s, length: %d.",
-                     Validator::objKeyFormat, MAX_KEY_LENGTH, FormatStringForLog(key), key.size()));
+                             FormatString("The key contains illegal char(s), allowed regex format: %s "
+                                          "or the length of key must be no more than 255. Current key: %s, length: %d.",
+                                          Validator::objKeyFormat, FormatStringForLog(key), key.size()));
     return Status::OK();
 }
 
@@ -4493,7 +3774,6 @@ int ObjectClientImpl::QueryGlobalRefNum(const std::string &objectKey)
 Status ObjectClientImpl::Delete(const std::vector<std::string> &objectKeys, std::vector<std::string> &failedObjectKeys)
 {
     PerfPoint perfPoint(PerfKey::HETERO_CLIENT_DELETE);
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(IsClientReady());
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(objectKeys));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsBatchSizeUnderLimit(objectKeys.size()), K_INVALID,
@@ -4530,8 +3810,6 @@ Status ObjectClientImpl::Set(const std::shared_ptr<Buffer> &buffer)
 {
     AccessTransportTracker::Reset();
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
     CHECK_FAIL_RETURN_STATUS(buffer != nullptr, K_INVALID, "The buffer should not be empty.");
     RETURN_IF_NOT_OK(buffer->CheckDeprecated());
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
@@ -4557,8 +3835,6 @@ Status ObjectClientImpl::MSet(const std::vector<std::shared_ptr<Buffer>> &buffer
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsBatchSizeUnderLimit(buffers.size()), K_INVALID,
                                          FormatString("The buffer size cannot exceed %d.", OBJECT_KEYS_MAX_SIZE_LIMIT));
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
@@ -4737,9 +4013,7 @@ Status ObjectClientImpl::MCreate(const std::vector<std::string> &keys, const std
     LOG(INFO) << "Begin to create multiput object." << VectorToString(keys);
     std::vector<bool> exist;
     bool skipCheckExistence = param.existence != ExistenceOpt::NX;
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    auto rc = MultiCreate(keys, sizes, param, skipCheckExistence, buffers, exist);
-    return rc;
+    return MultiCreate(keys, sizes, param, skipCheckExistence, buffers, exist);
 }
 
 Status ObjectClientImpl::MemoryCopyParallel(bool isParallel, const std::vector<std::string> &keys,
@@ -4749,7 +4023,6 @@ Status ObjectClientImpl::MemoryCopyParallel(bool isParallel, const std::vector<s
                                             AccessTransportKind *requestTransportKind)
 {
     const int sz = static_cast<int>(bufferList.size());
-    INJECT_POINT("ObjectClientImpl.MemoryCopyParallel.slow");
     std::atomic<AccessTransportKind> aggregatedTransport(AccessTransportKind::SHM);
     auto memoryCopy = [&](int start, int end) {
         for (int i = start; i < end; i++) {
@@ -4793,265 +4066,6 @@ Status ObjectClientImpl::MemoryCopyParallel(bool isParallel, const std::vector<s
     return rc;
 }
 
-Status ObjectClientImpl::MemoryCopyParallelWithDeadline(bool isParallel, const std::vector<std::string> &keys,
-                                                        const std::vector<StringView> &vals,
-                                                        const FullParam &creatParam,
-                                                        std::vector<std::shared_ptr<Buffer>> &bufferList,
-                                                        std::vector<std::shared_ptr<ObjectBufferInfo>> &bufferInfoList,
-                                                        uint64_t dataSizeSum, AccessTransportKind *requestTransportKind)
-{
-    RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
-    Timer memCopyTimer;
-    auto memCopyRc =
-        MemoryCopyParallel(isParallel, keys, vals, creatParam, bufferList, bufferInfoList, requestTransportKind);
-    int64_t memCopyCostUs = memCopyTimer.ElapsedMicroSecond();
-    int64_t memCopyRemainingUs = ApiDeadline::Instance().ApiRemainingUs();
-    SLOW_LOG_IF_OR_VLOG(
-        INFO, memCopyCostUs >= TimeoutDuration::SLOW_PATH_LOG_THRESHOLD_US || memCopyRc.IsError(), 1,
-        FormatString("[MSet] phase=MemoryCopyParallel costUs=%lld remainingUs=%lld size=%zu keys=%zu rc=%s",
-                     memCopyCostUs, memCopyRemainingUs, dataSizeSum, keys.size(), memCopyRc.ToString()));
-    RETURN_IF_NOT_OK(memCopyRc);
-    return ApiDeadline::Instance().CheckApiDeadline();
-}
-
-namespace {
-void ComputeDataSizes(const std::vector<StringView> &vals, std::vector<uint64_t> &sizes, uint64_t &sum)
-{
-    sizes.reserve(vals.size());
-    for (const auto &val : vals) {
-        sizes.emplace_back(val.size());
-        sum += val.size();
-    }
-}
-}  // namespace
-
-Status ObjectClientImpl::BuildMSetRouteGroups(const std::vector<std::string> &keys,
-                                              const std::vector<StringView> &values,
-                                              std::vector<MSetRouteGroup> &groups)
-{
-    auto routing = std::atomic_load(&routing_);
-    RETURN_RUNTIME_ERROR_IF_NULL(routing);
-    std::unordered_map<HostPort, std::vector<std::string>> groupedKeys;
-    RETURN_IF_NOT_OK(routing->SelectWorkers(keys, dataPlacementPolicy_, groupedKeys));
-    std::unordered_map<std::string, size_t> valueIndexes;
-    valueIndexes.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        valueIndexes.emplace(keys[i], i);
-    }
-    groups.reserve(groupedKeys.size());
-    size_t groupedKeyCount = 0;
-    for (auto &entry : groupedKeys) {
-        MSetRouteGroup group;
-        group.worker = entry.first;
-        group.keys = std::move(entry.second);
-        group.values.reserve(group.keys.size());
-        for (const auto &key : group.keys) {
-            auto iter = valueIndexes.find(key);
-            CHECK_FAIL_RETURN_STATUS(iter != valueIndexes.end(), K_RUNTIME_ERROR, "MSet route contains unknown key");
-            group.values.emplace_back(values[iter->second]);
-        }
-        groupedKeyCount += group.keys.size();
-        groups.emplace_back(std::move(group));
-    }
-    CHECK_FAIL_RETURN_STATUS(groupedKeyCount == keys.size(), K_RUNTIME_ERROR, "MSet route result is incomplete");
-    return Status::OK();
-}
-
-Status ObjectClientImpl::MemoryCopyTransportMSetBuffers(
-    const MSetRouteGroup &group, const std::vector<std::shared_ptr<ObjectBuffer>> &buffers, uint64_t dataSizeSum)
-{
-    CHECK_FAIL_RETURN_STATUS(group.values.size() == buffers.size(), K_RUNTIME_ERROR,
-                             "MSet transport buffer count mismatch");
-    RETURN_IF_NOT_OK(ApiDeadline::Instance().CheckApiDeadline());
-    auto memoryCopy = [&](size_t start, size_t end) {
-        for (size_t i = start; i < end; ++i) {
-            RETURN_IF_NOT_OK(buffers[i]->MemoryCopy(group.values[i].data(), group.values[i].size()));
-        }
-        return Status::OK();
-    };
-    static constexpr uint64_t MIN_PARALLEL_SIZE = 500 * KB;
-    static constexpr uint64_t PARALLEL_SIZE = 4 * MB_TO_BYTES;
-    static constexpr size_t PARALLEL_COUNT = 32;
-    const bool parallel = dataSizeSum > MIN_PARALLEL_SIZE
-                          && (dataSizeSum >= PARALLEL_SIZE || buffers.size() >= PARALLEL_COUNT);
-    Timer timer;
-    Status rc = (!parallel || parallismNum_ == 0)
-                    ? memoryCopy(0, buffers.size())
-                    : Parallel::ParallelFor<size_t>(0, buffers.size(), memoryCopy, 4, parallismNum_);
-    const int64_t elapsedUs = timer.ElapsedMicroSecond();
-    SLOW_LOG_IF_OR_VLOG(
-        INFO, elapsedUs >= TimeoutDuration::SLOW_PATH_LOG_THRESHOLD_US || rc.IsError(), 1,
-        FormatString("[MSet] phase=TransportMemoryCopy costUs=%lld size=%zu keys=%zu rc=%s",
-                     elapsedUs, dataSizeSum, group.keys.size(), rc.ToString()));
-    RETURN_IF_NOT_OK(rc);
-    return ApiDeadline::Instance().CheckApiDeadline();
-}
-
-Status ObjectClientImpl::ProcessTransportMSet(const MSetRouteGroup &group, const MSetParam &param,
-                                              const SetRouteContext &routeContext,
-                                              client::TransportMSetResult &result,
-                                              SetFailureStage &failureStage, PerfPoint &point)
-{
-    RETURN_RUNTIME_ERROR_IF_NULL(transportLayer_);
-    const auto requestContext = BuildTransportRequestContext(routeContext);
-    client::TransportCreateParam createParam;
-    createParam.requestContext = requestContext;
-    createParam.cacheType = param.cacheType;
-    createParam.consistencyType = ConsistencyType::CAUSAL;
-    createParam.writeMode = param.writeMode;
-    std::vector<uint64_t> sizes;
-    uint64_t dataSizeSum = 0;
-    ComputeDataSizes(group.values, sizes, dataSizeSum);
-    point.RecordAndReset(PerfKey::CLIENT_MSET_MULTICREATE);
-    failureStage = SetFailureStage::CREATE;
-    std::vector<std::shared_ptr<ObjectBuffer>> buffers;
-    RETURN_IF_NOT_OK(transportLayer_->MCreate(routeContext.worker, group.keys, sizes, createParam, buffers));
-    point.RecordAndReset(PerfKey::CLIENT_MSET_MEMCOPY);
-    failureStage = SetFailureStage::TRANSFER;
-    Status copyRc = MemoryCopyTransportMSetBuffers(group, buffers, dataSizeSum);
-    if (copyRc.IsError()) {
-        for (const auto &buffer : buffers) {
-            LOG_IF_ERROR(transportLayer_->Release(*buffer, requestContext),
-                         "Release routed MSet allocation after MemoryCopy failure failed");
-        }
-        return copyRc;
-    }
-    client::TransportSetParam setParam;
-    setParam.requestContext = requestContext;
-    setParam.ttlSecond = param.ttlSecond;
-    setParam.existence = param.existence;
-    point.RecordAndReset(PerfKey::CLIENT_MSET_MULTI_PUBLISH);
-    failureStage = SetFailureStage::PUBLISH;
-    Status rc = transportLayer_->MSet(buffers, setParam, result);
-    if (rc.GetCode() == K_URMA_NEED_CONNECT) {
-        failureStage = SetFailureStage::TRANSFER;
-    }
-    return rc;
-}
-
-Status ObjectClientImpl::BuildMSetRetryRouteGroups(const MSetRouteGroup &group,
-                                                   const std::vector<HostPort> &excludedWorkers,
-                                                   std::vector<MSetRouteGroup> &groups)
-{
-    auto routing = std::atomic_load(&routing_);
-    RETURN_RUNTIME_ERROR_IF_NULL(routing);
-    std::unordered_map<HostPort, std::vector<std::string>> groupedKeys;
-    RETURN_IF_NOT_OK(routing->SelectWorkers(group.keys, dataPlacementPolicy_, groupedKeys, excludedWorkers));
-    std::unordered_map<std::string, size_t> valueIndexes;
-    valueIndexes.reserve(group.keys.size());
-    for (size_t i = 0; i < group.keys.size(); ++i) {
-        valueIndexes.emplace(group.keys[i], i);
-    }
-    groups.reserve(groupedKeys.size());
-    for (auto &entry : groupedKeys) {
-        MSetRouteGroup retryGroup;
-        retryGroup.worker = entry.first;
-        retryGroup.keys = std::move(entry.second);
-        retryGroup.values.reserve(retryGroup.keys.size());
-        for (const auto &key : retryGroup.keys) {
-            auto value = valueIndexes.find(key);
-            CHECK_FAIL_RETURN_STATUS(value != valueIndexes.end(), K_RUNTIME_ERROR,
-                                     "MSet retry route contains unknown key");
-            retryGroup.values.emplace_back(group.values[value->second]);
-        }
-        groups.emplace_back(std::move(retryGroup));
-    }
-    return Status::OK();
-}
-
-Status ObjectClientImpl::ExecuteTransportMSetRetryGroups(
-    const std::vector<MSetRouteGroup> &groups, const MSetParam &param,
-    const std::vector<HostPort> &excludedWorkers, size_t attempt,
-    std::vector<std::string> &outFailedKeys, PerfPoint &point)
-{
-    const size_t failedBefore = outFailedKeys.size();
-    size_t objectCount = 0;
-    Status lastRc;
-    for (const auto &retryGroup : groups) {
-        objectCount += retryGroup.keys.size();
-        Status rc = ExecuteTransportMSetGroupAttempt(retryGroup, param, excludedWorkers, attempt,
-                                                     outFailedKeys, point);
-        if (rc.IsError()) {
-            lastRc = rc;
-        }
-    }
-    if (outFailedKeys.size() - failedBefore < objectCount) {
-        return Status::OK();
-    }
-    return lastRc.IsError() ? lastRc : Status(K_RUNTIME_ERROR, "All rerouted MSet objects failed");
-}
-
-Status ObjectClientImpl::ExecuteTransportMSetGroupAttempt(
-    const MSetRouteGroup &group, const MSetParam &param, std::vector<HostPort> excludedWorkers,
-    size_t attempt, std::vector<std::string> &outFailedKeys, PerfPoint &point)
-{
-    Status rc = ApiDeadline::Instance().CheckApiDeadline();
-    if (rc.IsError()) {
-        outFailedKeys.insert(outFailedKeys.end(), group.keys.begin(), group.keys.end());
-        return rc;
-    }
-    SetRouteContext routeContext;
-    rc = BuildSetRouteContext(group.worker, routeContext);
-    if (rc.IsError()) {
-        outFailedKeys.insert(outFailedKeys.end(), group.keys.begin(), group.keys.end());
-        return rc;
-    }
-    client::TransportMSetResult result;
-    SetFailureStage failureStage = SetFailureStage::CREATE;
-    rc = ProcessTransportMSet(group, param, routeContext, result, failureStage, point);
-    if (rc.IsOk()) {
-        outFailedKeys.insert(outFailedKeys.end(), result.failedKeys.begin(), result.failedKeys.end());
-        return rc;
-    }
-    if (!HandleSetRouteFailure(rc, failureStage, routeContext.worker, excludedWorkers)
-        || attempt + 1 >= SET_ROUTE_MAX_ATTEMPTS) {
-        const auto &failedKeys = result.failedKeys.empty() ? group.keys : result.failedKeys;
-        outFailedKeys.insert(outFailedKeys.end(), failedKeys.begin(), failedKeys.end());
-        return rc;
-    }
-    if (std::find(excludedWorkers.begin(), excludedWorkers.end(), routeContext.worker) == excludedWorkers.end()) {
-        excludedWorkers.emplace_back(routeContext.worker);
-    }
-    std::vector<MSetRouteGroup> retryGroups;
-    rc = BuildMSetRetryRouteGroups(group, excludedWorkers, retryGroups);
-    if (rc.IsError()) {
-        outFailedKeys.insert(outFailedKeys.end(), group.keys.begin(), group.keys.end());
-        return rc;
-    }
-    return ExecuteTransportMSetRetryGroups(retryGroups, param, excludedWorkers, attempt + 1, outFailedKeys, point);
-}
-
-Status ObjectClientImpl::ExecuteTransportMSetGroup(const MSetRouteGroup &group, const MSetParam &param,
-                                                   std::vector<std::string> &outFailedKeys, PerfPoint &point)
-{
-    return ExecuteTransportMSetGroupAttempt(group, param, {}, 0, outFailedKeys, point);
-}
-
-Status ObjectClientImpl::MSetThroughTransport(const std::vector<std::string> &keys,
-                                              const std::vector<StringView> &values, const MSetParam &param,
-                                              std::vector<std::string> &outFailedKeys, PerfPoint &point)
-{
-    std::vector<MSetRouteGroup> groups;
-    RETURN_IF_NOT_OK(BuildMSetRouteGroups(keys, values, groups));
-    const size_t failedBeforeMSet = outFailedKeys.size();
-    Status lastRc;
-    for (const auto &group : groups) {
-        const size_t failedBeforeGroup = outFailedKeys.size();
-        Status rc = ExecuteTransportMSetGroup(group, param, outFailedKeys, point);
-        if (rc.IsError()) {
-            lastRc = rc;
-            if (outFailedKeys.size() == failedBeforeGroup) {
-                outFailedKeys.insert(outFailedKeys.end(), group.keys.begin(), group.keys.end());
-            }
-        }
-    }
-    point.RecordAndReset(PerfKey::CLIENT_MSET_POST_PROCESS);
-    if (outFailedKeys.size() - failedBeforeMSet < keys.size()) {
-        return Status::OK();
-    }
-    return lastRc.IsError() ? lastRc : Status(K_RUNTIME_ERROR, "All objects set failed in worker");
-}
-
 Status ObjectClientImpl::MSetCreateCopyAndPublish(const std::vector<std::string> &keys,
                                                   const std::vector<StringView> &vals,
                                                   const std::vector<std::string> &deduplicateKeys,
@@ -5070,7 +4084,11 @@ Status ObjectClientImpl::MSetCreateCopyAndPublish(const std::vector<std::string>
     point.RecordAndReset(PerfKey::CLIENT_MSET_MULTICREATE);
     std::vector<uint64_t> dataSizeList;
     uint64_t dataSizeSum = 0;
-    ComputeDataSizes(filteredValues, dataSizeList, dataSizeSum);
+    dataSizeList.reserve(filteredValues.size());
+    for (const auto &val : filteredValues) {
+        dataSizeList.emplace_back(val.size());
+        dataSizeSum += val.size();
+    }
     std::vector<std::shared_ptr<Buffer>> bufferList;
     std::vector<bool> exist;
     RETURN_IF_NOT_OK(MultiCreate(filteredKeys, dataSizeList, creatParam, true, bufferList, exist));
@@ -5082,8 +4100,8 @@ Status ObjectClientImpl::MSetCreateCopyAndPublish(const std::vector<std::string>
         dataSizeSum > minSizeThreshold && (dataSizeSum >= sizeThreshold || filteredKeys.size() >= countThreshold);
     point.RecordAndReset(PerfKey::CLIENT_MSET_MEMCOPY);
     AccessTransportKind requestTransportKind = AccessTransportKind::SHM;
-    RETURN_IF_NOT_OK(MemoryCopyParallelWithDeadline(isParallel, filteredKeys, filteredValues, creatParam, bufferList,
-                                                    bufferInfoList, dataSizeSum, &requestTransportKind));
+    RETURN_IF_NOT_OK(MemoryCopyParallel(isParallel, filteredKeys, filteredValues, creatParam, bufferList,
+                                        bufferInfoList, &requestTransportKind));
     AccessTransportTracker::Record(requestTransportKind);
     point.RecordAndReset(PerfKey::CLIENT_MSET_MULTI_PUBLISH);
     MultiPublishRspPb rsp;
@@ -5110,20 +4128,11 @@ Status ObjectClientImpl::MSet(const std::vector<std::string> &keys, const std::v
     std::vector<std::string> deduplicateKeys;
     std::vector<StringView> deduplicateVals;
     RETURN_IF_NOT_OK(CheckMultiSetInputParamValidationNtx(keys, vals, outFailedKeys, deduplicateKeys, deduplicateVals));
-    RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
-    GetRequestContext()->reqTimeoutDuration.InitUs(ApiDeadline::Instance().ApiRemainingUs());
-    if (!enableLocalCache_) {
-        const auto &filteredKeys = deduplicateKeys.empty() ? keys : deduplicateKeys;
-        const auto &filteredValues = deduplicateVals.empty() ? vals : deduplicateVals;
-        return MSetThroughTransport(filteredKeys, filteredValues, param, outFailedKeys, point);
-    }
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
-    auto rc = MSetCreateCopyAndPublish(keys, vals, deduplicateKeys, deduplicateVals, param, workerApi, outFailedKeys,
-                                       point);
-    return rc;
+    return MSetCreateCopyAndPublish(keys, vals, deduplicateKeys, deduplicateVals, param, workerApi, outFailedKeys,
+                                    point);
 }
 
 Status ObjectClientImpl::GenerateKey(std::string &key, const std::string &prefixKey)
@@ -5218,7 +4227,6 @@ Status ObjectClientImpl::GetBlobsInfo(const std::string &devObjKey, int32_t time
 Status ObjectClientImpl::RemoveP2PLocation(const std::string &objectKey, int32_t deviceId)
 {
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
@@ -5229,7 +4237,6 @@ Status ObjectClientImpl::GetObjMetaInfo(const std::string &tenantId, const std::
                                         std::vector<ObjMetaInfo> &objMetas)
 {
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(objectKeys));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(objectKeys.size() <= OBJ_META_MAX_SIZE_LIMIT, K_INVALID,
                                          FormatString("The objectKeys size exceed %d.", OBJ_META_MAX_SIZE_LIMIT));
@@ -5258,7 +4265,6 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncDeleteDevObjects(const st
 
 Status ObjectClientImpl::DeleteDevObjects(const std::vector<std::string> &objKeys, std::vector<std::string> &failList)
 {
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(IsClientReady());
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(objKeys));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsBatchSizeUnderLimit(objKeys.size()), K_INVALID,
@@ -5706,32 +4712,27 @@ void ObjectClientImpl::ShutdownMetricsThread(bool dumpSummary)
     }
 }
 
-Status ObjectClientImpl::Exist(const std::vector<std::string> &keys, std::vector<bool> &exists, const bool queryL2Cache,
+Status ObjectClientImpl::Exist(const std::vector<std::string> &keys, std::vector<bool> &exists, const bool queryEtcd,
                                const bool isLocal)
 {
     PerfPoint perfPoint(PerfKey::CLIENT_EXIST);
     RETURN_IF_NOT_OK(IsClientReady());
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(keys));
-    CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsExistBatchSizeUnderLimit(keys.size()), K_INVALID,
-                                         FormatString("The objectKeys size exceed %d.", EXIST_KEYS_MAX_SIZE_LIMIT));
+    CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(keys.size() <= QUERY_SIZE_OBJECT_LIMIT, K_INVALID,
+                                         FormatString("The objectKeys size exceed %d.", QUERY_SIZE_OBJECT_LIMIT));
     auto config = GetClientLatencyTraceConfig();
     const bool traceEnabled = ShouldCollectLatencyTrace(config);
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_EXIST_START);
     }
+    std::shared_ptr<IClientWorkerApi> workerApi;
+    std::unique_ptr<Raii> raii;
+    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
     Timer timer;
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_EXIST_RPC_START);
     }
-    std::shared_ptr<IClientWorkerApi> workerApi;
-    std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
-    CHECK_FAIL_RETURN_STATUS(workerApi != nullptr, K_RUNTIME_ERROR, "No available worker API for Exist");
-    const auto tokenPtr = std::atomic_load(&transportToken_);
-    SensitiveValue token = (tokenPtr != nullptr) ? *tokenPtr : SensitiveValue();
-    Status rc =
-        RunExist(std::atomic_load(&routing_), transportLayer_, workerApi, keys, exists, queryL2Cache, isLocal, token);
+    auto rc = workerApi->Exist(keys, exists, queryEtcd, isLocal);
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_EXIST_RPC_END);
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_EXIST_END);
@@ -5743,29 +4744,13 @@ Status ObjectClientImpl::Exist(const std::vector<std::string> &keys, std::vector
     SLOW_LOG_IF_OR_VLOG(INFO, config.rpcSlowerThanUs > 0 && elapsedUs >= config.rpcSlowerThanUs, 1,
         FormatString("Finished check exist from worker, first object_key: %s, cost: %.3fms, rc: %s",
                      firstKey, elapsedMs, rc.ToString()));
-    perfPoint.Record();
     return rc;
-}
-
-Status ObjectClientImpl::RunExist(std::shared_ptr<client::Routing> routing,
-    std::unique_ptr<client::TransportLayer> &transportLayer, std::shared_ptr<IClientWorkerApi> &workerApi,
-    const std::vector<std::string> &keys, std::vector<bool> &exists, const bool queryL2Cache, const bool isLocal,
-    const SensitiveValue &token)
-{
-    if (routing != nullptr && transportLayer != nullptr) {
-        ExistHandlerRequest request{ keys, queryL2Cache, isLocal, requestTimeoutMs_, GetClientId(),
-            GetRequestContext()->tenantId.empty() ? tenantId_ : GetRequestContext()->tenantId, token };
-        ExistHandler flow(routing, transportLayer.get(), asyncGetRPCPool_);
-        return flow.Run(request, exists);
-    }
-    return workerApi->Exist(keys, exists, queryL2Cache, isLocal);
 }
 
 Status ObjectClientImpl::Expire(const std::vector<std::string> &keys, uint32_t ttlSeconds,
                                 std::vector<std::string> &failedKeys)
 {
     PerfPoint perfPoint(PerfKey::CLIENT_EXPIRE_OBJECT);
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(IsClientReady());
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(keys));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(keys.size() <= QUERY_SIZE_OBJECT_LIMIT, K_INVALID,
@@ -5781,7 +4766,6 @@ Status ObjectClientImpl::Expire(const std::vector<std::string> &keys, uint32_t t
 Status ObjectClientImpl::GetMetaInfo(const std::vector<std::string> &keys, const bool isDevKey,
                                      std::vector<MetaInfo> &metaInfos, std::vector<std::string> &failKeys)
 {
-    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(IsClientReady());
     RETURN_IF_NOT_OK(CheckValidObjectKeyVector(keys));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(keys.size() <= QUERY_SIZE_OBJECT_LIMIT, K_INVALID,

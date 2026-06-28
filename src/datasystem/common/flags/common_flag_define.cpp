@@ -114,6 +114,8 @@ DS_DEFINE_bool(enable_huge_tlb, false,
                "default is disable.");
 DS_DEFINE_bool(enable_data_replication, true,
                "Allow data replica cache locally; mainly for performance validation, keep enabled unless needed.");
+DS_DEFINE_bool(enable_meta_affinity_replicate, false,
+               "After same-node publish, async replicate data to the metadata owner worker and swap primary copy.");
 
 DS_DEFINE_bool(enable_memory_rebalance, false,
     "Enable master-scheduled memory rebalance across workers. The master periodically schedules tasks to migrate "

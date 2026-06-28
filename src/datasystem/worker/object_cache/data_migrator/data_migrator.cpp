@@ -273,7 +273,7 @@ void DataMigrator::SubmitL2CacheTasksBySlot(const std::map<uint32_t, std::vector
         auto strategy = std::make_shared<ScaleDownNodeSelector>(membership_, localAddress_);
         LOG(INFO) << FormatString("[MigrateL2Cache] Slot %u (%zu objects) -> %s", slot, objs.size(),
                                   currentTarget.ToString());
-        futures.emplace_back(slot, MigrateToTargetNode(objs, currentTarget, strategy, false, slot));
+        futures.emplace_back(slot, MigrateToTargetNode(objs, currentTarget, strategy, false, slot, true));
         sameNodeRetryCounts[slot] = 0;
     }
 }
@@ -290,9 +290,10 @@ bool DataMigrator::TrySubmitSameNodeRetryForL2Slot(uint32_t slot, const MigrateD
 
     int retryCount = ++sameNodeRetryCounts[slot];
     if (retryCount > maxSameNodeRetryCount) {
-        LOG(WARNING) << FormatString("[MigrateL2Cache] Slot %u same-node failedIds retry exceeded max(%d), stop "
-                                     "retry on node %s",
-                                     slot, maxSameNodeRetryCount, result.address);
+        LOG(WARNING) << FormatString(
+            "[MigrateL2Cache] Slot %u same-node failedIds retry exceeded max(%d), stop "
+            "retry on node %s",
+            slot, maxSameNodeRetryCount, result.address);
         return true;
     }
 
@@ -309,7 +310,7 @@ bool DataMigrator::TrySubmitSameNodeRetryForL2Slot(uint32_t slot, const MigrateD
         slot, result.address, retryCount, maxSameNodeRetryCount, result.successIds.size(), result.failedIds.size());
     newFutures.emplace_back(
         slot, MigrateToTargetNode(std::vector<std::string>{ result.failedIds.begin(), result.failedIds.end() },
-                                  sameHost, result.strategy, true, slot));
+                                  sameHost, result.strategy, true, slot, true));
     return true;
 }
 
@@ -338,7 +339,7 @@ void DataMigrator::TrySubmitRedirectRetryForL2Slot(uint32_t slot, MigrateDataHan
     LOG(INFO) << FormatString("[MigrateL2Cache] Slot %u retry with new node: %s", slot, nextTarget);
     newFutures.emplace_back(
         slot, MigrateToTargetNode(std::vector<std::string>{ result.failedIds.begin(), result.failedIds.end() },
-                                  hostPort, result.strategy, false, slot));
+                                  hostPort, result.strategy, false, slot, true));
 }
 
 Status DataMigrator::ProcessL2CacheSlotFutures(std::vector<SlotMigrateFuture> &futures, int maxSameNodeRetryCount,

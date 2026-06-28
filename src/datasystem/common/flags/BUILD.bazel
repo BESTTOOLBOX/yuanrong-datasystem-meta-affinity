@@ -38,6 +38,7 @@ ds_cc_library(
 ds_cc_library(
     name = "ds_flags",
     srcs = [
+        "cluster_master_flags.cpp",
         "embedded_config.cpp",
         "flag_manager.cpp",
         "flags.cpp",

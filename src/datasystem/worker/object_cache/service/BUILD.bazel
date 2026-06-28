@@ -235,6 +235,8 @@ ds_cc_library(
         "//src/datasystem/common/util:thread_local",
         "//src/datasystem/protos:master_object_cc_proto",
         "//src/datasystem/worker:authenticate",
+        "//src/datasystem/worker/object_cache:meta_affinity_replicate_executor",
+        "//src/datasystem/worker/object_cache:meta_affinity_replicate_manager",
         "//src/datasystem/worker/object_cache:object_kv",
         "//src/datasystem/worker/object_cache:worker_master_oc_api",
     ],

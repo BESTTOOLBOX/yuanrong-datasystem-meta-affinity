@@ -18,7 +18,6 @@
 
 #include <utility>
 
-
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/iam/tenant_auth_manager.h"
 #include "datasystem/common/inject/inject_point.h"
@@ -37,21 +36,25 @@
 #include "datasystem/common/util/strings_util.h"
 #include "datasystem/common/util/request_context.h"
 #include "datasystem/common/util/thread_local.h"
+#include "datasystem/object/object_enum.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/worker/authenticate.h"
 #include "datasystem/worker/object_cache/obj_cache_shm_unit.h"
 #include "datasystem/worker/object_cache/object_kv.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
+#include "datasystem/worker/object_cache/meta_affinity_replicate_executor.h"
+#include "datasystem/worker/object_cache/meta_affinity_replicate_manager.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rdma/rdma_util.h"
+
+DS_DECLARE_bool(enable_meta_affinity_replicate);
 
 using namespace datasystem::worker;
 using namespace datasystem::master;
 namespace datasystem {
 namespace object_cache {
 static constexpr int DEBUG_LOG_LEVEL = 2;
-
 
 static constexpr double US_PER_MS = 1000.0;
 
@@ -63,6 +66,52 @@ WorkerOcServicePublishImpl::WorkerOcServicePublishImpl(WorkerOcServiceCrudParam 
       akSkManager_(std::move(akSkManager)),
       localAddress_(localAddress)
 {
+    metaAffinityReplicateManager_ = std::make_unique<MetaAffinityReplicateManager>();
+    (void)metaAffinityReplicateManager_->Init(
+        [this](MetaAffinityReplicateTask &&task) { MetaAffinityReplicateFunc(std::move(task)); });
+}
+
+void WorkerOcServicePublishImpl::MetaAffinityReplicateFunc(MetaAffinityReplicateTask &&task)
+{
+    MetaAffinityReplicateContext ctx{
+        .metadataRouteResolver = metadataRouteResolver_,
+        .membership = membership_,
+        .endpointPolicy = endpointPolicy_,
+        .exitRequested = exitRequested_,
+        .localAddress = localAddress_,
+        .akSkManager = akSkManager_,
+        .objectTable = objectTable_,
+        .workerMasterApiManager = workerMasterApiManager_,
+    };
+    for (const auto &param : task.GetParams()) {
+        (void)ExecuteMetaAffinityReplicate(param, ctx);
+    }
+}
+
+void WorkerOcServicePublishImpl::StopMetaAffinityReplicate()
+{
+    if (metaAffinityReplicateManager_ != nullptr) {
+        metaAffinityReplicateManager_->Stop();
+    }
+}
+
+void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV)
+{
+    if (!FLAGS_enable_meta_affinity_replicate || metaAffinityReplicateManager_ == nullptr) {
+        return;
+    }
+    const auto &objectKey = objectKV.GetObjKey();
+    const SafeObjType &safeObj = objectKV.GetObjEntry();
+    if (safeObj->stateInfo.GetDataFormat() != DataFormat::BINARY) {
+        return;
+    }
+    MetaAffinityReplicateParam param{
+        .objectKey = objectKey,
+        .version = safeObj->GetCreateTime(),
+        .dataFormat = static_cast<uint32_t>(safeObj->stateInfo.GetDataFormat()),
+    };
+    MetaAffinityReplicateTask task(std::move(param));
+    (void)metaAffinityReplicateManager_->AddTask(std::move(task));
 }
 
 Status WorkerOcServicePublishImpl::VertifyObjectReleaseValidity(const PublishReqPb &req, const SafeObjType &safeObj)
@@ -146,8 +195,8 @@ Status WorkerOcServicePublishImpl::CreateMetadataToMaster(const ObjectKV &object
     Timer rpcTimer;
     Status rc = RedirectRetryWhenMetaMoving(metaReq, metaResp, workerMasterApi, func);
     const auto rpcUs = static_cast<uint64_t>(rpcTimer.ElapsedMicroSecond());
-    FinalizeMasterRpcLatency(LatencyTickKey::WORKER_CREATE_META_RPC_END, config, traceEnabled,
-                             metaResp, objectKey, rpcUs, rc, workerMasterApi, "CreateMeta");
+    FinalizeMasterRpcLatency(LatencyTickKey::WORKER_CREATE_META_RPC_END, config, traceEnabled, metaResp, objectKey,
+                             rpcUs, rc, workerMasterApi, "CreateMeta");
     RETURN_IF_NOT_OK(rc);
     point.Record();
     version = metaResp.version();
@@ -193,8 +242,8 @@ Status WorkerOcServicePublishImpl::UpdateMetadataToMaster(const ObjectKV &object
     Timer rpcTimer;
     Status rc = RedirectRetryWhenMetaMoving(metaReq, metaRsp, workerMasterApi, func);
     const auto rpcUs = static_cast<uint64_t>(rpcTimer.ElapsedMicroSecond());
-    FinalizeMasterRpcLatency(LatencyTickKey::WORKER_UPDATE_META_RPC_END, config, traceEnabled,
-                             metaRsp, objectKey, rpcUs, rc, workerMasterApi, "UpdateMeta");
+    FinalizeMasterRpcLatency(LatencyTickKey::WORKER_UPDATE_META_RPC_END, config, traceEnabled, metaRsp, objectKey,
+                             rpcUs, rc, workerMasterApi, "UpdateMeta");
     RETURN_IF_NOT_OK(rc);
     version = metaRsp.version();
     return Status::OK();
@@ -221,8 +270,10 @@ Status WorkerOcServicePublishImpl::RequestingToMaster(ObjectKV &objectKV, const 
     // network-latency-deducted one): this is a hard "budget exhausted" check.
     int64_t remainingUs = GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTimeUs();
     if (remainingUs <= 0) {
-        LOG(INFO) << FormatString("[ObjectKey %s] deadline gate: skip master RPC, client budget exhausted "
-                                  "(remaining %ld us).", objectKey, remainingUs);
+        LOG(INFO) << FormatString(
+            "[ObjectKey %s] deadline gate: skip master RPC, client budget exhausted "
+            "(remaining %ld us).",
+            objectKey, remainingUs);
         return Status(StatusCode::K_RPC_DEADLINE_EXCEEDED,
                       FormatString("Request timeout before master RPC, remaining %ld us.", remainingUs));
     }
@@ -320,6 +371,7 @@ Status WorkerOcServicePublishImpl::PublishObject(ObjectKV &objectKV, const Publi
         VLOG(DEBUG_LOG_LEVEL) << FormatString("Finishing deleting the object %s from disk.", objectKey);
     }
     evictionManager_->Add(objectKey);
+    ScheduleMetaAffinityReplicateIfNeeded(objectKV);
     return Status::OK();
 }
 
@@ -469,9 +521,9 @@ Status WorkerOcServicePublishImpl::Publish(const PublishReqPb &req, PublishRspPb
     }
     const auto totalPublishUs = static_cast<uint64_t>(timer.ElapsedMicroSecond());
     if (ShouldPrintLatencySummary(totalPublishUs, config)) {
-        PhaseDurationResult result = ComputePhaseDurations(
-            Trace::Instance().GetLatencyTicks(), Trace::Instance().GetLatencyTickCount(),
-            Trace::Instance().GetLatencyTickDroppedCount());
+        PhaseDurationResult result =
+            ComputePhaseDurations(Trace::Instance().GetLatencyTicks(), Trace::Instance().GetLatencyTickCount(),
+                                  Trace::Instance().GetLatencyTickDroppedCount());
         bool hasDownstream = Trace::Instance().GetDownstreamPhases().count > 0;
         MergeDownstreamPhases(result);
         bool gateHit = CheckPhaseGate(result, config);
@@ -486,7 +538,7 @@ Status WorkerOcServicePublishImpl::Publish(const PublishReqPb &req, PublishRspPb
     const double totalPublishMs = static_cast<double>(totalPublishUs) / US_PER_MS;
     GetWorkerTimeCost().Append("Total Publish", totalPublishMs);
     SLOW_LOG_IF_OR_VLOG(INFO, config.processSlowerThanUs > 0 && totalPublishUs >= config.processSlowerThanUs, 1,
-        FormatString("Publish done, cost: %.3fms, %s", totalPublishMs, GetWorkerTimeCost().GetInfo()));
+                        FormatString("Publish done, cost: %.3fms, %s", totalPublishMs, GetWorkerTimeCost().GetInfo()));
     return rc;
 }
 

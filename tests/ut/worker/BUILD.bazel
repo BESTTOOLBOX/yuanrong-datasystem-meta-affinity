@@ -184,6 +184,17 @@ ds_cc_test(
     ],
 )
 
+ds_cc_test(
+    name = "meta_affinity_replicate_test",
+    srcs = ["object_cache/meta_affinity_replicate_test.cpp"],
+    deps = [
+        "//src/datasystem/common/flags:ds_flags",
+        "//src/datasystem/worker/object_cache:meta_affinity_replicate_executor",
+        "//src/datasystem/worker/object_cache:meta_affinity_replicate_manager",
+        "//tests/ut:ut_common",
+    ],
+)
+
 # 认证测试
 ds_cc_test(
     name = "authenticate_test",
@@ -494,6 +505,7 @@ test_suite(
     tests = [
         "async_resource_releaser_test",
         "async_updatelocation_test",
+        "meta_affinity_replicate_test",
         "authenticate_test",
         "client_manager_test",
         "coordinator_watch_service_test",

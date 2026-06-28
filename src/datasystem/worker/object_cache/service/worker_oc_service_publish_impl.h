@@ -35,7 +35,6 @@ namespace object_cache {
 
 class WorkerOcServicePublishImpl : public WorkerOcServiceCrudCommonApi {
 public:
-
     /**
      * @brief Construct WorkerOcServicePublishImpl.
      * @param[in] initParam The parameter used to init WorkerOcServiceCrudCommonApi.
@@ -44,8 +43,7 @@ public:
      * @param[in] localAddress The local worker address.
      */
     WorkerOcServicePublishImpl(WorkerOcServiceCrudParam &initParam, std::shared_ptr<ThreadPool> memCpyThreadPool,
-                               std::shared_ptr<AkSkManager> akSkManager,
-                               HostPort &localAddress);
+                               std::shared_ptr<AkSkManager> akSkManager, HostPort &localAddress);
 
     /**
      * @brief Handle Put/Publish/Seal request from the client.
@@ -55,6 +53,8 @@ public:
      * @return K_OK on success; the error code otherwise.
      */
     Status Publish(const PublishReqPb &req, PublishRspPb &resp, std::vector<RpcMessage> &payloads);
+
+    void StopMetaAffinityReplicate();
 
 private:
     struct PublishParams {
@@ -150,10 +150,9 @@ private:
             Trace::Instance().AddLatencyTick(endKey);
         }
         SLOW_LOG_IF_OR_VLOG(INFO, config.rpcSlowerThanUs > 0 && rpcUs >= config.rpcSlowerThanUs, 1,
-            AppendSrcDstForLog(
-                FormatString("[Set] %s RPC done, objectKey: %s, costUs: %zu, rc: %s", operationName,
-                             objectKey, rpcUs, rc.ToString()),
-                localAddress_.ToString(), workerMasterApi->GetHostPort()));
+                            AppendSrcDstForLog(FormatString("[Set] %s RPC done, objectKey: %s, costUs: %zu, rc: %s",
+                                                            operationName, objectKey, rpcUs, rc.ToString()),
+                                               localAddress_.ToString(), workerMasterApi->GetHostPort()));
         if (traceEnabled && rsp.latency_phase_us_size() > 0) {
             std::vector<uint32_t> phases(rsp.latency_phase_us().begin(), rsp.latency_phase_us().end());
             MergeDecodedPhasesToTrace(phases, rsp.latency_tick_dropped_count());
@@ -194,6 +193,10 @@ private:
      */
     Status TryDeleteObjFromEvictionAndSpillFile(ObjectKV &objectKV, bool isInsert);
 
+    void MetaAffinityReplicateFunc(MetaAffinityReplicateTask &&task);
+    void ScheduleMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV);
+
+    std::unique_ptr<MetaAffinityReplicateManager> metaAffinityReplicateManager_{ nullptr };
     std::shared_ptr<ThreadPool> memCpyThreadPool_{ nullptr };
 
     std::shared_ptr<AkSkManager> akSkManager_{ nullptr };

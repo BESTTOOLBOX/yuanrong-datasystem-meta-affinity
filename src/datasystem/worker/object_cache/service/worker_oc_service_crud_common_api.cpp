@@ -165,6 +165,7 @@ WorkerOcServiceCrudCommonApi::WorkerOcServiceCrudCommonApi(WorkerOcServiceCrudPa
       asyncSendManager_(initParam.asyncSendManager),
       metadataSize_(initParam.metadataSize),
       metadataRouteResolver_(initParam.metadataRouteResolver),
+      membership_(initParam.membership),
       endpointPolicy_(initParam.endpointPolicy),
       exitRequested_(initParam.exitRequested),
       allowDirectoryLag_(initParam.allowDirectoryLag),
@@ -188,9 +189,8 @@ Status WorkerOcServiceCrudCommonApi::SaveBinaryObjectToPersistence(ObjectKV &obj
     CHECK_FAIL_RETURN_STATUS(remainingTime > 0, K_RPC_DEADLINE_EXCEEDED,
                              FormatString("Request timeout (%ld ms).", -remainingTime));
     PerfPoint point(PerfKey::WORKER_SAVE_L2_CACHE);
-    Status res = persistenceApi_->Save(
-        objectKey, entry->GetCreateTime(), remainingTime, buf, 0, entry->modeInfo.GetWriteMode(),
-        entry->GetTtlSecond());
+    Status res = persistenceApi_->Save(objectKey, entry->GetCreateTime(), remainingTime, buf, 0,
+                                       entry->modeInfo.GetWriteMode(), entry->GetTtlSecond());
     point.Record();
 
     uint64_t oldVersionMax = entry->GetCreateTime() - 1;
@@ -449,12 +449,11 @@ Status WorkerOcServiceCrudCommonApi::RemoveMetadataFromRedirectMaster(
 }
 
 void WorkerOcServiceCrudCommonApi::HandleRemoveMetaResponse(
-    const Status &result, const std::list<std::string> &objectKeysRemoveList,
-    master::RemoveMetaRspPb &response, const master::RemoveMetaReqPb::Cause removeCause,
-    const std::string &localAddress, const std::unordered_map<std::string, uint64_t> &batchKeyVersions,
-    std::vector<std::string> &failedIds, std::vector<std::string> &needMigrateIds,
-    std::vector<std::string> &needWaitIds, std::vector<std::string> &needMigrateL2CacheIds,
-    const std::string &topologyOperationId)
+    const Status &result, const std::list<std::string> &objectKeysRemoveList, master::RemoveMetaRspPb &response,
+    const master::RemoveMetaReqPb::Cause removeCause, const std::string &localAddress,
+    const std::unordered_map<std::string, uint64_t> &batchKeyVersions, std::vector<std::string> &failedIds,
+    std::vector<std::string> &needMigrateIds, std::vector<std::string> &needWaitIds,
+    std::vector<std::string> &needMigrateL2CacheIds, const std::string &topologyOperationId)
 {
     if (result.IsError()) {
         LOG(WARNING) << "remove meta failed: " << result.ToString();
@@ -466,13 +465,12 @@ void WorkerOcServiceCrudCommonApi::HandleRemoveMetaResponse(
                                      needWaitIds, needMigrateL2CacheIds, topologyOperationId);
 }
 
-void WorkerOcServiceCrudCommonApi::BatchRemoveMeta(const std::vector<std::string> &objectKeys,
-    const std::shared_ptr<worker::WorkerMasterOCApi> &workerMasterApi,
+void WorkerOcServiceCrudCommonApi::BatchRemoveMeta(
+    const std::vector<std::string> &objectKeys, const std::shared_ptr<worker::WorkerMasterOCApi> &workerMasterApi,
     const master::RemoveMetaReqPb::Cause removeCause, const std::string &localAddress,
-    const std::unordered_map<std::string, uint64_t> &batchKeyVersions,
-    std::vector<std::string> &failedIds, std::vector<std::string> &needMigrateIds,
-    std::vector<std::string> &needWaitIds, std::vector<std::string> &needMigrateL2CacheIds,
-    const std::string &topologyOperationId)
+    const std::unordered_map<std::string, uint64_t> &batchKeyVersions, std::vector<std::string> &failedIds,
+    std::vector<std::string> &needMigrateIds, std::vector<std::string> &needWaitIds,
+    std::vector<std::string> &needMigrateL2CacheIds, const std::string &topologyOperationId)
 {
     std::list<std::string> objectKeysRemoveList;
     const uint32_t objBatch = 300;
@@ -511,8 +509,8 @@ void WorkerOcServiceCrudCommonApi::BatchRemoveMeta(const std::vector<std::string
             InitRemoveMetaRpcDeadline(!topologyOperationId.empty());
         }
         master::RemoveMetaRspPb response;
-        Status result = RemoveMeta(objectKeysRemoveList, workerMasterApi, removeCause, version, true,
-                                   localAddress, batchKeyVersions, response, topologyOperationId);
+        Status result = RemoveMeta(objectKeysRemoveList, workerMasterApi, removeCause, version, true, localAddress,
+                                   batchKeyVersions, response, topologyOperationId);
         HandleRemoveMetaResponse(result, objectKeysRemoveList, response, removeCause, localAddress, batchKeyVersions,
                                  failedIds, needMigrateIds, needWaitIds, needMigrateL2CacheIds, topologyOperationId);
     }

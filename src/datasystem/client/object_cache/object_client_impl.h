@@ -26,15 +26,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "re2/re2.h"
 
-#include "datasystem/utils/device_blob.h"
 #include "datasystem/client/client_state_manager.h"
 #include "datasystem/client/embedded_client_worker_api.h"
 #include "datasystem/client/listen_worker.h"
@@ -45,12 +42,6 @@
 #include "datasystem/client/object_cache/client_worker_api/client_worker_remote_api.h"
 #include "datasystem/client/object_cache/device/client_device_object_manager.h"
 #include "datasystem/client/object_cache/device/p2p_subscribe.h"
-#include "datasystem/client/object_cache/exist_handler.h"
-#include "datasystem/client/routing/routing.h"
-#include "datasystem/client/transport/transport_layer.h"
-#include "datasystem/common/ak_sk/signature.h"
-#include "datasystem/client/routing/worker_router.h"
-#include "datasystem/client/transport/data_plane/i_data_transporter.h"
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/log/latency_phase_types.h"
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
@@ -84,6 +75,8 @@ namespace datasystem {
 namespace object_cache {
 using TbbGlobalRefTable = tbb::concurrent_hash_map<std::string, int>;
 using GlobalRefInfo = std::pair<int, std::shared_ptr<TbbGlobalRefTable::accessor>>;
+
+class MetaAffinityClientRingSource;
 
 struct P2PPeer {
     void *devPointer;
@@ -167,24 +160,6 @@ public:
                           bool traceEnabled);
 
     /**
-     * @brief Send buffer data via UB using a pre-allocated URMA pool buffer.
-     *        Copies user data into the pool-allocated buffer, then RDMA-writes
-     *        directly to the worker. Avoids the temporary pool allocation in
-     *        SendBufferViaUb.
-     * @param[in] bufferInfo The buffer info with pool-allocated pointer.
-     * @param[in] data The data to be sent.
-     * @param[in] length The length of the data to be sent.
-     * @param[in] traceEnabled Whether latency trace is enabled.
-     * @return K_OK on success; the error code otherwise.
-     */
-    Status SendBufferViaUbFromPool(const std::shared_ptr<ObjectBufferInfo> &bufferInfo, const void *data,
-                                   uint64_t length, bool traceEnabled);
-
-    std::shared_ptr<ObjectBufferInfo> MakeUbPoolBufferInfo(const std::string &objectKey, uint64_t dataSize,
-                                                           const FullParam &param, uint32_t version,
-                                                           const ShmKey &shmId);
-
-    /**
      * @brief Invoke worker client to publish all buffers of all the given object keys.
      * @param[in] buffers The vector of the all the buffers.
      * @param[out]  failList The objects that are failed to be published
@@ -221,7 +196,7 @@ public:
      * one extra memory copy.
      *
      * @param[in] keys The ID of the object to create. ID should not be empty and should only contains english
-     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should be no more than 1024.
+     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should less than 256.
      * @param[in] size The size in bytes of object.
      * @param[in] param The create parameters.
      * @param[out] buffer The buffer for the object.
@@ -339,15 +314,14 @@ public:
     /**
      * @brief Invoke worker client to get an object.
      * @param[in] objectKeys The vector of the object key.
-     * @param[in] devBlob share memory ptr and size pair.
-     * @param[out] buffers buffer for values.
-     * @param[in] h2dStream cuda stream for cuda task submmiting.
+     * @param[in] devShmChunk share memory ptr and size pair.
+     * @param[in] subTimeoutMs timeoutMs of waiting for the result return if object not ready. A positive integer number
+     * required. 0 means no waiting time allowed.
      * @return Status of the result.
      */
-    std::shared_future<AsyncResult> GetWithOsTransportPipeline(const std::vector<std::string> &objectKeys,
-                                                               const std::vector<Blob> &devBlob,
-                                                               std::vector<std::shared_ptr<Buffer>> &buffers,
-                                                               void *h2dStream = nullptr);
+    std::shared_future<AsyncResult> GetWithOsTransportPipeline(
+        const std::vector<std::string> &objectKeys, const std::vector<std::pair<void *, size_t>> &devShmChunk,
+        int64_t subTimeoutMs);
 
     /**
      * @brief Some data in an object can be read based on the specified key and parameters.
@@ -487,7 +461,7 @@ public:
     /**
      * @brief Invoke worker client to create a device object with p2p.
      * @param[in] objectKey The ID of the device object to create. ID should not be empty and should only contains
-     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should be no more than 1024.
+     * english alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should less than 256.
      * @param[in] devBlobList The list of blob info.
      * @param[in] param The create param of device object.
      * @param[out] deviceBuffer The device buffer for the object.
@@ -499,7 +473,7 @@ public:
     /**
      * @brief Invoke worker client to get the given device object keys and copy to the destinationdevice buffer.
      * @param[in] devObjKeys The vector of the object key. ID should not be empty and should only contains english
-     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should be no more than 1024.
+     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should less than 256.
      * Pass one object key to vector if you just want to get an device object. Don't support to pass multi object keys
      * now.
      * @param[out] dstDevBuffer The destination of device buffer.
@@ -526,7 +500,7 @@ public:
     /**
      * @brief Obtains the DBlobInfos, including the number of blobs, and the count
      * @param[in] devObjKey The object key. ID should not be empty and should only contains english
-     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should be no more than 1024.
+     * alphabetics (a-zA-Z), numbers and ~!@#$%^&*.-_ only. ID length should less than 256.
      * @param[in] timeoutMs Waiting for the result return if object not ready. A positive integer number required.
      * 0 means no waiting time allowed. And the range is [0, INT32_MAX].
      * @param[out] blobs The list of data info. (Include pointer、count and data type)
@@ -581,14 +555,6 @@ public:
      */
     Status MGetH2D(const std::vector<std::string> &objectKeys, const std::vector<DeviceBlobList> &devBlobList,
                    std::vector<std::string> &failedKeys, uint64_t timeoutMs);
-
-    /**
-     * @brief Pre-register device memory regions for RemoteH2D/HCCS transfers.
-     * @param[in] data Device memory addresses.
-     * @param[in] dataSize Device memory region sizes.
-     * @return Status of the result.
-     */
-    Status PreRegisterDeviceMemory(const std::vector<void *> &data, const std::vector<uint64_t> &dataSize);
 
     /**
      * @brief For device object, to async get multiple objects
@@ -685,7 +651,7 @@ public:
 
     /**
      * @brief Check whether the keys exist in the data system.
-     * @param[in] keys The keys to be checked. Constraint: The number of keys cannot exceed 100000.
+     * @param[in] keys The keys to be checked. Constraint: The number of keys cannot exceed 10000.
      * @param[in] exists The existence of the corresponding key.
      * @param[in] queryL2Cache whether query L2Cache.
      * @param[in] isLocal Is a local query or not.
@@ -693,12 +659,6 @@ public:
      */
     Status Exist(const std::vector<std::string> &keys, std::vector<bool> &exists, const bool queryL2Cache,
                  const bool isLocal);
-
-    Status RunExist(std::shared_ptr<client::Routing> routing,
-                    std::unique_ptr<client::TransportLayer> &transportLayer,
-                    std::shared_ptr<IClientWorkerApi> &workerApi, const std::vector<std::string> &keys,
-                    std::vector<bool> &exists, const bool queryL2Cache, const bool isLocal,
-                    const SensitiveValue &token);
     /**
      * @brief Sets expiration time for key list (in seconds)
      * @param[in] key The keys to set expiration for.
@@ -733,39 +693,6 @@ public:
     std::string GetTransportType() const;
 
 private:
-    enum class SetFailureStage { CREATE, TRANSFER, PUBLISH };
-
-    struct SetRouteContext {
-        HostPort worker;
-        std::shared_ptr<IClientWorkerApi> clientApi;
-        std::shared_ptr<IClientWorkerApi> directWorkerApi;
-        std::unique_ptr<Raii> invokeGuard;
-    };
-
-    struct MSetRouteGroup {
-        HostPort worker;
-        std::vector<std::string> keys;
-        std::vector<StringView> values;
-    };
-
-    Status BuildSetRouteContext(const HostPort &worker, SetRouteContext &routeContext);
-
-    Status SelectSetRoute(const std::string &objectKey, const std::vector<HostPort> &excludedWorkers,
-                          SetRouteContext &routeContext);
-
-    client::TransportRequestContext BuildTransportRequestContext(const SetRouteContext &routeContext) const;
-
-    Status ProcessTransportPut(const std::string &objectKey, const uint8_t *data, uint64_t size,
-                               const FullParam &param, const std::unordered_set<std::string> &nestedObjectKeys,
-                               uint32_t ttlSecond, int existence, const SetRouteContext &routeContext,
-                               SetFailureStage &failureStage);
-
-    bool HandleSetRouteFailure(const Status &status, SetFailureStage failureStage, const HostPort &worker,
-                               std::vector<HostPort> &excludedWorkers);
-
-    Status ExecuteSetFlow(const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
-                          const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence);
-
     friend Buffer;
     friend DeviceBuffer;
     friend ClientDeviceObjectManager;
@@ -791,11 +718,6 @@ private:
      */
     Status CheckMGetH2DInput(const std::vector<std::string> &objectKeys,
                              const std::vector<DeviceBlobList> &devBlobList);
-
-    /**
-     * @brief Release device memory regions pre-registered by this client.
-     */
-    void CleanupPreRegisteredDeviceMemory();
 
     /**
      * @brief The core synchronous implementation shared by MSetD2H and AsyncMSetD2H.
@@ -935,25 +857,6 @@ private:
     Status GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> workerApi, GetParam &getParam,
                                 std::vector<std::shared_ptr<Buffer>> &buffers);
 
-    Status InitTransportLayer();
-
-    void BuildTransportReadRequest(const std::vector<std::string> &objectKeys, client::ObjectReadRequest &request,
-                                   std::vector<Status> &itemStatuses) const;
-
-    Status GetFromTransportLayer(const std::vector<std::string> &objectKeys,
-                                 std::vector<std::shared_ptr<Buffer>> &buffers);
-
-    Status MaterializeTransportItem(const std::string &objectKey, client::ObjectReadItemResult &item,
-                                    std::shared_ptr<Buffer> &buffer);
-
-    Status ApplyTransportReadResult(const std::vector<std::string> &objectKeys,
-                                    const client::ObjectReadRequest &request, client::ObjectReadResult &result,
-                                    const Status &transportStatus, std::vector<std::shared_ptr<Buffer>> &buffers,
-                                    std::vector<Status> &itemStatuses, AccessTransportKind &actualKind);
-
-    Status FinishTransportRead(const std::vector<Status> &itemStatuses, AccessTransportKind actualKind,
-                               const Status &transportStatus);
-
 #ifdef USE_URMA
     /**
      * @brief Get buffers from worker in sub-batches when total UB data exceeds the max buffer size.
@@ -968,53 +871,6 @@ private:
                                        std::vector<std::shared_ptr<Buffer>> &buffers,
                                        const std::vector<ObjMetaInfo> &objMetas, uint64_t ubMaxGetSize,
                                        AccessTransportKind *requestTransportKind);
-
-    /**
-     * @brief Get one oversized object from worker in UB-sized chunks.
-     * @param[in] workerApi The worker that handles get request.
-     * @param[in] getParam The parameters of get request.
-     * @param[in] objectIndex Index of the oversized object.
-     * @param[in] objectSize Full object size.
-     * @param[in] ubMaxGetSize Maximum UB buffer size per Get RPC.
-     * @param[out] buffer The merged object buffer.
-     * @param[out] requestTransportKind The merged transport kind.
-     * @return Status of the result.
-     */
-    Status GetOversizedBufferFromWorkerByChunks(std::shared_ptr<IClientWorkerApi> workerApi, const GetParam &getParam,
-                                                size_t objectIndex, uint64_t objectSize, uint64_t ubMaxGetSize,
-                                                std::shared_ptr<Buffer> &buffer,
-                                                AccessTransportKind *requestTransportKind);
-
-    /**
-     * @brief Get one chunk of an oversized object.
-     * @param[in] workerApi The worker that handles get request.
-     * @param[in] getParam The parameters of get request.
-     * @param[in] objectKey Object key to get.
-     * @param[in] offset Chunk offset in the object.
-     * @param[in] chunkSize Chunk size in bytes.
-     * @param[out] chunkBuffer The chunk buffer returned by worker.
-     * @param[out] version Object version returned by worker.
-     * @param[out] requestTransportKind The merged transport kind.
-     * @return Status of the result.
-     */
-    Status GetOversizedBufferChunk(std::shared_ptr<IClientWorkerApi> workerApi, const GetParam &getParam,
-                                   const std::string &objectKey, uint64_t offset, uint64_t chunkSize,
-                                   std::shared_ptr<Buffer> &chunkBuffer, uint32_t &version,
-                                   AccessTransportKind *requestTransportKind);
-
-    /**
-     * @brief Copy one chunk into the merged oversized object buffer.
-     * @param[in] objectKey Object key to get.
-     * @param[in] objectSize Full object size.
-     * @param[in] offset Chunk offset in the object.
-     * @param[in] chunkBuffer The chunk buffer returned by worker.
-     * @param[out] buffer The merged object buffer.
-     * @param[out] copiedSize Number of bytes copied from the chunk.
-     * @return Status of the result.
-     */
-    Status CopyOversizedBufferChunk(const std::string &objectKey, uint64_t objectSize, uint64_t offset,
-                                    const std::shared_ptr<Buffer> &chunkBuffer, std::shared_ptr<Buffer> &buffer,
-                                    uint64_t &copiedSize);
 #endif
 
     /**
@@ -1049,23 +905,6 @@ private:
                             std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedObjectKey,
                             const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>>
                                 &ubBufferInfos = {});
-
-    /**
-     * @brief Fill in buffer for non-shm cases, and accumulate read-bytes metrics by transport (URMA/TCP).
-     * @param[in] objectKey The object key of the cache object.
-     * @param[in] payloadInfo The protobuf object info.
-     * @param[in] version Object version.
-     * @param[in] payloads The read buffers.
-     * @param[in] ubBufferInfos URMA buffer candidates keyed by object key; a hit selects the URMA path.
-     * @param[out] bufferPtr The object buffer.
-     * @return K_OK on success; the error code otherwise.
-     */
-    Status SetNoShmObjectBufferWithMetric(const std::string &objectKey, const GetRspPb::PayloadInfoPb &payloadInfo,
-                                          uint32_t version, std::vector<RpcMessage> &payloads,
-                                          const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>>
-                                              &ubBufferInfos,
-                                          std::shared_ptr<Buffer> &bufferPtr);
-
     /**
      * @brief Fill in buffer for non-shm cases.
      * @param[in] objectKey The object key of the cache object.
@@ -1358,6 +1197,15 @@ private:
      */
     Status GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi> &workerApi, std::unique_ptr<Raii> &raii);
 
+    bool HasHealthyLocalWorker() const;
+
+    bool ShouldRouteWriteToMetaOwner() const;
+
+    Status EnsureMetaAffinityRingSource();
+
+    Status GetWriteWorkerApi(const std::string &objectKey, std::shared_ptr<IClientWorkerApi> &workerApi,
+                             std::unique_ptr<Raii> &raii);
+
     /**
      * @brief Mmap a ShmUnit to client.
      * @param[in] fd The ShmUnit store fd.
@@ -1394,27 +1242,7 @@ private:
      */
     Status ProcessShmPut(const std::string &objectKey, const uint8_t *data, uint64_t size, const FullParam &param,
                          const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond,
-                         const std::shared_ptr<IClientWorkerApi> &workerApi, int existence,
-                         SetFailureStage &failureStage);
-
-    /**
-     * @brief Mmap-lookup of a shared-memory object, bounded by the current API deadline.
-     * @param[in] shmBuf The shared-memory unit info.
-     * @param[in] size Size in bytes to look up.
-     * @return Status of the call.
-     */
-
-    Status TimedMmapLookupWithDeadline(const std::shared_ptr<ShmUnitInfo> &shmBuf, uint64_t size);
-    /**
-     * @brief Copy object data into a buffer, bounded by the current API deadline.
-     * @param[in] buffer The destination buffer.
-     * @param[in] data The source data pointer.
-     * @param[in] size Size in bytes to copy.
-     * @param[in] traceEnabled Whether to record trace timing.
-     * @return Status of the call.
-     */
-    Status TimedMemoryCopyWithDeadline(const std::shared_ptr<Buffer> &buffer, const uint8_t *data, uint64_t size,
-                                       bool traceEnabled);
+                         const std::shared_ptr<IClientWorkerApi> &workerApi, int existence);
 
     /**
      * @brief construcs object key with tenant id
@@ -1440,61 +1268,13 @@ private:
                                                 std::vector<StringView> &deduplicateVals);
 
     /**
-     * @brief Legacy local-cache MSet path retained while SHM batch transport is not implemented in TransportLayer.
+     * @brief Create buffers, copy values, and publish for MSet with outFailedKeys.
      */
     Status MSetCreateCopyAndPublish(const std::vector<std::string> &keys, const std::vector<StringView> &vals,
                                     const std::vector<std::string> &deduplicateKeys,
                                     const std::vector<StringView> &deduplicateVals, const MSetParam &param,
                                     const std::shared_ptr<IClientWorkerApi> &workerApi,
                                     std::vector<std::string> &outFailedKeys, PerfPoint &point);
-
-    Status BuildMSetRouteGroups(const std::vector<std::string> &keys, const std::vector<StringView> &values,
-                                std::vector<MSetRouteGroup> &groups);
-
-    Status MemoryCopyTransportMSetBuffers(const MSetRouteGroup &group,
-                                          const std::vector<std::shared_ptr<ObjectBuffer>> &buffers,
-                                          uint64_t dataSizeSum);
-
-    Status ProcessTransportMSet(const MSetRouteGroup &group, const MSetParam &param,
-                                const SetRouteContext &routeContext, client::TransportMSetResult &result,
-                                SetFailureStage &failureStage, PerfPoint &point);
-
-    Status ExecuteTransportMSetGroup(const MSetRouteGroup &group, const MSetParam &param,
-                                     std::vector<std::string> &outFailedKeys, PerfPoint &point);
-
-    Status ExecuteTransportMSetGroupAttempt(const MSetRouteGroup &group, const MSetParam &param,
-                                            std::vector<HostPort> excludedWorkers, size_t attempt,
-                                            std::vector<std::string> &outFailedKeys, PerfPoint &point);
-
-    Status BuildMSetRetryRouteGroups(const MSetRouteGroup &group, const std::vector<HostPort> &excludedWorkers,
-                                     std::vector<MSetRouteGroup> &groups);
-
-    Status ExecuteTransportMSetRetryGroups(const std::vector<MSetRouteGroup> &groups, const MSetParam &param,
-                                           const std::vector<HostPort> &excludedWorkers, size_t attempt,
-                                           std::vector<std::string> &outFailedKeys, PerfPoint &point);
-
-    /** @brief Routed MSet path used when local cache is disabled; replaces the legacy path after SHM batch support. */
-    Status MSetThroughTransport(const std::vector<std::string> &keys, const std::vector<StringView> &values,
-                                const MSetParam &param, std::vector<std::string> &outFailedKeys, PerfPoint &point);
-
-    /**
-     * @brief Memory copy with deadline check and slow-path logging.
-     * @param[in] isParallel Whether to copy in parallel.
-     * @param[in] keys The object keys.
-     * @param[in] vals The object values.
-     * @param[in] creatParam The create parameters.
-     * @param[in,out] bufferList The buffer list.
-     * @param[in,out] bufferInfoList The buffer info list.
-     * @param[in] dataSizeSum The total data size.
-     * @param[out] requestTransportKind The transport kind used.
-     * @return Status of the call.
-     */
-    Status MemoryCopyParallelWithDeadline(bool isParallel, const std::vector<std::string> &keys,
-                                          const std::vector<StringView> &vals, const FullParam &creatParam,
-                                          std::vector<std::shared_ptr<Buffer>> &bufferList,
-                                          std::vector<std::shared_ptr<ObjectBufferInfo>> &bufferInfoList,
-                                          uint64_t dataSizeSum, AccessTransportKind *requestTransportKind);
-
     /**
      * @brief Muti create buffer parallel
      * @param[in] skipCheckExistence is skip check existence
@@ -1533,18 +1313,12 @@ private:
 
     void ConstructTreadPool();
 
-    Status ApplyRoutingWorkerSnapshot(uint64_t ringVersion, const ::datasystem::ClusterTopologyPb &ring);
-
-    Status InitRouting(const HostPort &initialWorker, bool initialWorkerIsLocal);
-
     Status InitClientWorkerConnect(bool enableHeartbeat, bool initWithWorker, int32_t connectTimeoutMs = -1);
 
     Status InitClientWorkerConnectAt(WorkerNode node, const HostPort &address, bool enableHeartbeat,
                                      bool initWithWorker, int32_t connectTimeoutMs);
 
     Status InitClientRuntimeAt(WorkerNode node, bool initWithWorker, bool isLocalWorker);
-
-    Status GetCurrentWorkerHostPort(HostPort &addr) const;
 
     /**
      * @brief Configure the URMA data-plane failover callback on a worker API instance.
@@ -1705,8 +1479,9 @@ private:
      * @param[out] workerApi  The worker that handles get request.
      * @return K_OK on success; the error code otherwise.
      */
-    Status CheckPipelineRH2DArgs(const std::vector<std::string> &objectKeys, const std::vector<Blob> &devBlob,
-                                 std::shared_ptr<IClientWorkerApi> &workerApi);
+    Status CheckPipelineRH2DArgs(const std::vector<std::string> &objectKeys,
+                                 const std::vector<std::pair<void *, size_t>> &devShmChunk,
+                                 std::shared_ptr<IClientWorkerApi> &workerApi, int64_t subTimeoutMs);
 
     /**
      * @brief construct share memory buffer and find need wait keys
@@ -1715,26 +1490,22 @@ private:
      * @param rsp Get response
      * @param piplnRh2dParam Use chunkManager and payload member
      * @param version Key value version
+     * @param buffers Value buffers
      * @param failedKeys Failed to fetch value keys
      * @return std::vector<std::pair<std::string *, uint32_t>> need to wait keys
      */
     std::vector<std::pair<std::string *, uint32_t>> PostProcessPipelineKeys(
-        std::vector<std::string> &objectKeys, GetRspPb &rsp, PiplnRh2dParam &piplnRh2dParam, uint32_t version,std::vector<std::string> &failedKeys);
+        std::vector<std::string> &objectKeys, GetRspPb &rsp, PiplnRh2dParam &piplnRh2dParam, uint32_t version,
+        std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedKeys);
     /**
      * @brief post process rh2d response
      *
      * @param promise Pipeline rh2d promise
      * @param piplnRh2dParam Pipeline rh2d params
      * @param rsp Get response
-     * @param buffers buffer list of values
      * @return K_OK on success; the error code otherwise.
      */
-    Status PostPipelineRH2D(std::promise<AsyncResult> &promise, PiplnRh2dParam &piplnRh2dParam, GetRspPb &rsp,
-                            std::vector<std::shared_ptr<Buffer>> &buffers);
-
-    Status SetShmObjectBufferWithMetric(const std::string &objectKey, const GetRspPb::ObjectInfoPb &info,
-                                        uint32_t version, const std::vector<ReadParam> &readParams, size_t index,
-                                        std::shared_ptr<Buffer> &bufferPtr);
+    Status PostPipelineRH2D(std::promise<AsyncResult> &promise, PiplnRh2dParam &piplnRh2dParam, GetRspPb &rsp);
 
     HostPort ipAddress_;
     RpcAuthKeys authKeys_;
@@ -1745,8 +1516,7 @@ private:
     SensitiveValue token_;
     std::string tenantId_;
     bool enableCrossNodeConnection_ = false;
-    bool enableLocalCache_ = true;
-    client::DataPlacementPolicy dataPlacementPolicy_ = client::DataPlacementPolicy::PREFERRED_SAME_NODE;
+    bool enableExclusiveConnection_ = false;
     std::unique_ptr<Signature> signature_{ nullptr };
     std::vector<std::shared_ptr<IClientWorkerApi>> workerApi_;
     std::atomic<WorkerNode> currentNode_{ LOCAL_WORKER };
@@ -1756,8 +1526,6 @@ private:
     uint64_t switchGeneration_{ 0 };
     std::unique_ptr<client::MmapManager> mmapManager_{ nullptr };
     std::unique_ptr<ClientDeviceObjectManager> devOcImpl_{ nullptr };
-    std::mutex preRegisteredDeviceMemoryMutex_;
-    std::vector<void *> preRegisteredDeviceMemoryAddrs_;
     bool enableRemoteH2D_;
     int32_t devId_ = -1;
     std::string deviceId_;
@@ -1780,10 +1548,6 @@ private:
     std::shared_ptr<ThreadPool> asyncSwitchWorkerPool_;
     std::shared_ptr<ThreadPool> asyncDevDeletePool_;
     std::shared_ptr<ThreadPool> asyncReleasePool_;
-    std::shared_ptr<Signature> transportSignature_;
-    std::shared_ptr<const SensitiveValue> transportToken_;
-    std::unique_ptr<client::TransportLayer> transportLayer_;
-    std::shared_ptr<client::Routing> routing_;
 
     // Listenworker needs to be placed at the bottom to ensure that it is destructed first.
     std::vector<std::shared_ptr<client::ListenWorker>> listenWorker_;
@@ -1807,7 +1571,12 @@ private:
     int parallismNum_ = 0;
     uint64_t memcpyParallelThreshold_ = 0;
 
-    std::shared_ptr<IServiceDiscovery> serviceDiscovery_ = nullptr;
+    std::shared_ptr<ServiceDiscovery> serviceDiscovery_ = nullptr;
+
+    std::mutex metaAffinityWriteMutex_;
+    std::shared_ptr<MetaAffinityClientRingSource> metaAffinityRingSource_;
+    std::shared_ptr<IClientWorkerApi> metaAffinityWriteWorkerApi_;
+    HostPort metaAffinityWriteWorkerAddress_;
 };
 }  // namespace object_cache
 }  // namespace datasystem

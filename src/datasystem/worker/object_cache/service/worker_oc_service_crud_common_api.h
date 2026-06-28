@@ -32,6 +32,7 @@
 #include "datasystem/common/util/request_context.h"
 #include "datasystem/common/util/thread_pool.h"
 
+#include "datasystem/cluster/membership/membership_endpoint_view.h"
 #include "datasystem/worker/object_cache/async_send_manager.h"
 #include "datasystem/worker/object_cache/device/worker_device_oc_manager.h"
 #include "datasystem/worker/object_cache/object_endpoint_policy.h"
@@ -44,7 +45,6 @@ namespace datasystem {
 namespace object_cache {
 class AsyncPersistenceDelManager {
 public:
-
     /**
      * @brief AsyncPersistenceDelManager.
      * @param[in] pool oldVerDelAsyncPool.
@@ -91,6 +91,7 @@ struct WorkerOcServiceCrudParam {
     size_t metadataSize;
     std::shared_ptr<PersistenceApi> persistenceApi;
     const worker::MetadataRouteResolver *metadataRouteResolver;
+    const cluster::MembershipEndpointView *membership;
     const ObjectEndpointPolicy *endpointPolicy;
     const std::atomic<bool> *exitRequested;
     bool allowDirectoryLag;
@@ -98,7 +99,6 @@ struct WorkerOcServiceCrudParam {
 
 class WorkerOcServiceCrudCommonApi {
 public:
-
     /**
      * @brief Construct WorkerOcServiceCrudCommonApi.
      * @param[in] initParam The parameter used to init WorkerOcServiceCrudCommonApi.
@@ -131,9 +131,8 @@ public:
         static const int64_t maxSleepTimeMs = 128;
         int64_t sleepTimeMs = initSleepTimeMs;
         while (true) {
-            CHECK_FAIL_RETURN_STATUS(
-                GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() > 0,
-                K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
+            CHECK_FAIL_RETURN_STATUS(GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() > 0,
+                                     K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
             RETURN_IF_NOT_OK(fun(req, rsp));
             if (!rsp.meta_is_moving()) {
                 if (rsp.info().redirect_meta_address().empty()) {
@@ -174,9 +173,8 @@ public:
         static const int64_t maxSleepTimeMs = 128;
         int64_t sleepTimeMs = initSleepTimeMs;
         while (true) {
-            CHECK_FAIL_RETURN_STATUS(
-                GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() > 0,
-                K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
+            CHECK_FAIL_RETURN_STATUS(GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() > 0,
+                                     K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
             RETURN_IF_NOT_OK(func(req, rsp));
             RETURN_OK_IF_TRUE(!rsp.meta_is_moving());
             rsp.Clear();
@@ -204,9 +202,8 @@ public:
         static const int64_t maxSleepTimeMs = 128;
         int64_t sleepTimeMs = initSleepTimeMs;
         while (true) {
-            CHECK_FAIL_RETURN_STATUS(
-                GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() > 0,
-                K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
+            CHECK_FAIL_RETURN_STATUS(GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() > 0,
+                                     K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
             RETURN_IF_NOT_OK(func(req, rsp, payload));
             RETURN_OK_IF_TRUE(!rsp.meta_is_moving());
             rsp.Clear();
@@ -394,7 +391,6 @@ public:
                             const std::string &topologyOperationId = "");
 
 protected:
-
     /**
      * #brief Check if CheckIfNeedRetry
      * @param rsp Response of redirect
@@ -429,16 +425,16 @@ private:
      * @param[out] needMigrateL2CacheIds Object keys requiring L2 cache migration.
      * @param[in] topologyOperationId Fenced topology operation id, or empty for ordinary traffic.
      */
-    void HandleRemoveMetaResponse(
-        const Status &result, const std::list<std::string> &objectKeysRemoveList,
-        master::RemoveMetaRspPb &response, const master::RemoveMetaReqPb::Cause removeCause,
-        const std::string &localAddress, const std::unordered_map<std::string, uint64_t> &batchKeyVersions,
-        std::vector<std::string> &failedIds, std::vector<std::string> &needMigrateIds,
-        std::vector<std::string> &needWaitIds, std::vector<std::string> &needMigrateL2CacheIds,
-        const std::string &topologyOperationId);
+    void HandleRemoveMetaResponse(const Status &result, const std::list<std::string> &objectKeysRemoveList,
+                                  master::RemoveMetaRspPb &response, const master::RemoveMetaReqPb::Cause removeCause,
+                                  const std::string &localAddress,
+                                  const std::unordered_map<std::string, uint64_t> &batchKeyVersions,
+                                  std::vector<std::string> &failedIds, std::vector<std::string> &needMigrateIds,
+                                  std::vector<std::string> &needWaitIds,
+                                  std::vector<std::string> &needMigrateL2CacheIds,
+                                  const std::string &topologyOperationId);
 
 protected:
-
     std::shared_ptr<worker::WorkerMasterApiManagerBase<worker::WorkerMasterOCApi>> workerMasterApiManager_{ nullptr };
 
     WorkerRequestManager &workerRequestManager_;
@@ -459,6 +455,7 @@ protected:
 
     L2StorageType supportL2Storage_;
     const worker::MetadataRouteResolver *metadataRouteResolver_{ nullptr };
+    const cluster::MembershipEndpointView *membership_{ nullptr };
     const ObjectEndpointPolicy *endpointPolicy_{ nullptr };
     const std::atomic<bool> *exitRequested_{ nullptr };
     const bool allowDirectoryLag_{ false };

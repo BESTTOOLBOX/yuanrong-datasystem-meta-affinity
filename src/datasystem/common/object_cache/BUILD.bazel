@@ -8,7 +8,7 @@ ds_cc_library(
     name = "common_object_cache",
     srcs = glob(
         ["*.cpp"],
-        exclude = ["buffer.cpp", "device_buffer.cpp", "buffer_composer.cpp", "object_buffer.cpp"],
+        exclude = ["buffer.cpp", "device_buffer.cpp", "buffer_composer.cpp", "object_buffer.cpp", "read_only_hash_ring_view.cpp"],
     ),
     hdrs = glob(["*.h"]),
     deps = [
@@ -89,6 +89,22 @@ ds_cc_library(
 )
 
 alias(name = "node_info", actual = ":common_object_cache")
+
+ds_cc_library(
+    name = "read_only_hash_ring_view_lib",
+    srcs = ["read_only_hash_ring_view.cpp"],
+    hdrs = ["read_only_hash_ring_view.h"],
+    linkstatic = True,
+    deps = [
+        "//src/datasystem/common/flags:ds_flags",
+        "//src/datasystem/common/util:hash_algorithm",
+        "//src/datasystem/common/util:net_util",
+        "//src/datasystem/common/util:status_helper",
+        "//src/datasystem/protos:cluster_topology_cc_proto",
+    ],
+)
+
+alias(name = "read_only_hash_ring_view", actual = ":read_only_hash_ring_view_lib")
 
 ds_cc_library(
     name = "object_buffer",

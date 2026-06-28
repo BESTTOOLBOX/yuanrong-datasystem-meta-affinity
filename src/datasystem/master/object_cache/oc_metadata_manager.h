@@ -1773,6 +1773,7 @@ private:
      * @return Selected location.
      */
     std::string SelectObjectLocation(const std::string &objectKey, const std::string &sourceWorker,
+                                     const std::string &primaryAddress,
                                      const std::unordered_map<ImmutableString, AckState> &locations);
 
     template <class F, class... Args>

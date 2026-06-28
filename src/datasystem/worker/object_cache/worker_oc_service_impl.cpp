@@ -227,12 +227,10 @@ WorkerOCServiceImpl::WorkerOCServiceImpl(HostPort serverAddr, HostPort masterAdd
                                          std::shared_ptr<ObjectTable> objectTable, std::shared_ptr<AkSkManager> manager,
                                          std::shared_ptr<WorkerOcEvictionManager> evictionManager,
                                          std::shared_ptr<PersistenceApi> persistApi, EtcdStore *etcdStore,
-                                         MasterOCServiceImpl *masterOCService,
-                                         cluster::TopologyEngine *topologyEngine,
+                                         MasterOCServiceImpl *masterOCService, cluster::TopologyEngine *topologyEngine,
                                          const worker::MetadataRouteResolver &metadataRoute,
                                          const cluster::MembershipEndpointView &membership,
-                                         const std::atomic<bool> *exitRequested,
-                                         bool isRestart,
+                                         const std::atomic<bool> *exitRequested, bool isRestart,
                                          bool controlBackendAvailableAtStartup)
     : WorkerOCService(std::move(serverAddr)),
       localMasterAddress_(std::move(masterAddr)),
@@ -327,32 +325,30 @@ void WorkerOCServiceImpl::InitServiceImpl()
         .metadataSize = metadataSize_,
         .persistenceApi = persistenceApi_,
         .metadataRouteResolver = &metadataRoute_,
+        .membership = &membership_,
         .endpointPolicy = &endpointPolicy_,
         .exitRequested = exitRequested_,
         .allowDirectoryLag = centralizedMetadata_,
     };
     createProc_ = std::make_shared<WorkerOcServiceCreateImpl>(param, akSkManager_, localAddress_);
 
-    publishProc_ = std::make_shared<WorkerOcServicePublishImpl>(param, memCpyThreadPool_, akSkManager_,
-                                                                localAddress_);
+    publishProc_ = std::make_shared<WorkerOcServicePublishImpl>(param, memCpyThreadPool_, akSkManager_, localAddress_);
 
-    multiPublishProc_ = std::make_shared<WorkerOcServiceMultiPublishImpl>(param, memCpyThreadPool_,
-                                                                          threadPool_, akSkManager_, localAddress_);
+    multiPublishProc_ = std::make_shared<WorkerOcServiceMultiPublishImpl>(param, memCpyThreadPool_, threadPool_,
+                                                                          akSkManager_, localAddress_);
 
     migrateRateController_ =
         std::make_shared<MigrateDataRateController>(FLAGS_data_migrate_rate_limit_mb * 1024ul * 1024ul);
-    getProc_ =
-        std::make_shared<WorkerOcServiceGetImpl>(param, etcdStore_, memCpyThreadPool_, threadPool_,
-                                                 akSkManager_, localAddress_, migrateRateController_);
+    getProc_ = std::make_shared<WorkerOcServiceGetImpl>(param, etcdStore_, memCpyThreadPool_, threadPool_, akSkManager_,
+                                                        localAddress_, migrateRateController_);
 
-    deleteProc_ =
-        std::make_shared<WorkerOcServiceDeleteImpl>(param, akSkManager_, localAddress_, getProc_);
+    deleteProc_ = std::make_shared<WorkerOcServiceDeleteImpl>(param, akSkManager_, localAddress_, getProc_);
 
-    gRefProc_ = std::make_shared<WorkerOcServiceGlobalReferenceImpl>(param, globalRefTable_,
-                                                                     akSkManager_, localAddress_);
+    gRefProc_ =
+        std::make_shared<WorkerOcServiceGlobalReferenceImpl>(param, globalRefTable_, akSkManager_, localAddress_);
 
-    gMigrateProc_ = std::make_shared<WorkerOcServiceMigrateImpl>(
-        param, memCpyThreadPool_, akSkManager_, GetLocalAddr().ToString(), migrateRateController_);
+    gMigrateProc_ = std::make_shared<WorkerOcServiceMigrateImpl>(param, memCpyThreadPool_, akSkManager_,
+                                                                 GetLocalAddr().ToString(), migrateRateController_);
 
     expireProc_ = std::make_shared<WorkerOcServiceExpireImpl>(param, akSkManager_);
     initOk_.set_value(Status::OK());
@@ -407,20 +403,16 @@ Status WorkerOCServiceImpl::InitThreadResources()
 Status WorkerOCServiceImpl::InitRecoveryServices()
 {
     MetaDataRecoveryManager::ClusterAccess clusterAccess;
-    clusterAccess.checkConnection = [this](const HostPort &addr) {
-        return endpointPolicy_.CheckEndpoint(addr, false);
-    };
-    metadataRecoveryManager_ =
-        std::make_unique<MetaDataRecoveryManager>(localAddress_, objectTable_, std::move(clusterAccess),
-                                                  workerMasterApiManager_, metadataRoute_, metadataSize_,
-                                                  evictionManager_, memCpyThreadPool_);
+    clusterAccess.checkConnection = [this](const HostPort &addr) { return endpointPolicy_.CheckEndpoint(addr, false); };
+    metadataRecoveryManager_ = std::make_unique<MetaDataRecoveryManager>(
+        localAddress_, objectTable_, std::move(clusterAccess), workerMasterApiManager_, metadataRoute_, metadataSize_,
+        evictionManager_, memCpyThreadPool_);
     AsyncResourceReleaser::Instance().Init(objectTable_);
     InitServiceImpl();
-    NodeSelector::Instance().Init(localAddress_.ToString(), membership_, exitRequested_,
-                                  workerMasterApiManager_);
+    NodeSelector::Instance().Init(localAddress_.ToString(), membership_, exitRequested_, workerMasterApiManager_);
     getProc_->Init();
-    RETURN_IF_NOT_OK(slotRecoveryManager_->Init(localAddress_, membership_, persistenceApi_,
-                                                workerMasterApiManager_, etcdStore_, metadataRecoveryManager_.get()));
+    RETURN_IF_NOT_OK(slotRecoveryManager_->Init(localAddress_, membership_, persistenceApi_, workerMasterApiManager_,
+                                                etcdStore_, metadataRecoveryManager_.get()));
     clearDataFlow_ = std::make_unique<WorkerOcServiceClearDataFlow>(
         objectTable_, globalRefTable_, workerMasterApiManager_, gRefProc_, deleteProc_, metadataRecoveryManager_.get(),
         metadataRoute_, endpointPolicy_, localAddress_.ToString());
@@ -683,8 +675,7 @@ Status WorkerOCServiceImpl::DrainTopologyScaleInData(const cluster::TopologyPhas
     std::vector<std::string> waitIds;
     std::vector<std::string> l2Ids;
     RETURN_IF_NOT_OK(SelectTopologyScaleInObjects(copies, primaries));
-    RETURN_IF_NOT_OK(
-        PrepareTopologyScaleInData(copies, primaries, migrateIds, waitIds, l2Ids, businessOperationId));
+    RETURN_IF_NOT_OK(PrepareTopologyScaleInData(copies, primaries, migrateIds, waitIds, l2Ids, businessOperationId));
     RETURN_IF_NOT_OK(MigrateData(migrateIds, action.taskId, deadline, cancellation));
     std::vector<std::string> failures;
     GroupAndRemoveMeta(migrateIds, master::RemoveMetaReqPb::NORMAL, failures, migrateIds, waitIds, l2Ids,
@@ -702,9 +693,9 @@ Status WorkerOCServiceImpl::DrainTopologyScaleInData(const cluster::TopologyPhas
     return Status::OK();
 }
 
-Status WorkerOCServiceImpl::GetOrCreateTopologyScaleInCleanupState(
-    const cluster::IKeyFilter &filter, const std::string &businessOperationId,
-    std::shared_ptr<PreparedScaleInCleanupState> &state)
+Status WorkerOCServiceImpl::GetOrCreateTopologyScaleInCleanupState(const cluster::IKeyFilter &filter,
+                                                                   const std::string &businessOperationId,
+                                                                   std::shared_ptr<PreparedScaleInCleanupState> &state)
 {
     {
         std::lock_guard<std::mutex> lock(topologyScaleInCleanupMutex_);
@@ -740,8 +731,7 @@ Status WorkerOCServiceImpl::GetOrCreateTopologyScaleInCleanupState(
     return Status::OK();
 }
 
-Status WorkerOCServiceImpl::AuthorizeTopologyScaleInCleanup(
-    const std::shared_ptr<PreparedScaleInCleanupState> &state)
+Status WorkerOCServiceImpl::AuthorizeTopologyScaleInCleanup(const std::shared_ptr<PreparedScaleInCleanupState> &state)
 {
     std::lock_guard<std::mutex> lock(topologyScaleInCleanupMutex_);
     state->authorized = true;
@@ -762,9 +752,10 @@ Status WorkerOCServiceImpl::ApplyTopologyCleanupEffects(const std::vector<std::s
     return Status::OK();
 }
 
-Status WorkerOCServiceImpl::ApplyTopologyScaleInCleanup(
-    const std::string &businessOperationId, const std::shared_ptr<PreparedScaleInCleanupState> &state,
-    std::chrono::steady_clock::time_point deadline, const cluster::CancellationToken &cancellation)
+Status WorkerOCServiceImpl::ApplyTopologyScaleInCleanup(const std::string &businessOperationId,
+                                                        const std::shared_ptr<PreparedScaleInCleanupState> &state,
+                                                        std::chrono::steady_clock::time_point deadline,
+                                                        const cluster::CancellationToken &cancellation)
 {
     CHECK_FAIL_RETURN_STATUS(!cancellation.IsCancelled(), K_NOT_READY, "topology cleanup cancelled");
     CHECK_FAIL_RETURN_STATUS(std::chrono::steady_clock::now() < deadline, K_RPC_DEADLINE_EXCEEDED,
@@ -807,9 +798,7 @@ Status WorkerOCServiceImpl::PrepareTopologyScaleInCleanup(const cluster::Topolog
     CHECK_FAIL_RETURN_STATUS(!cancellation.IsCancelled(), K_NOT_READY, "topology cleanup cancelled");
     CHECK_FAIL_RETURN_STATUS(std::chrono::steady_clock::now() < deadline, K_RPC_DEADLINE_EXCEEDED,
                              "topology cleanup deadline exceeded");
-    authorize = [this, state] {
-        return AuthorizeTopologyScaleInCleanup(state);
-    };
+    authorize = [this, state] { return AuthorizeTopologyScaleInCleanup(state); };
     apply = [this, businessOperationId, state](std::chrono::steady_clock::time_point applyDeadline,
                                                const cluster::CancellationToken &applyCancellation) {
         return ApplyTopologyScaleInCleanup(businessOperationId, state, applyDeadline, applyCancellation);
@@ -817,10 +806,11 @@ Status WorkerOCServiceImpl::PrepareTopologyScaleInCleanup(const cluster::Topolog
     return Status::OK();
 }
 
-Status WorkerOCServiceImpl::SubmitTopologyFailureCleanup(
-    const cluster::TopologyPhaseAction &action, const cluster::IKeyFilter &filter,
-    const std::string &businessOperationId, std::chrono::steady_clock::time_point deadline,
-    const cluster::CancellationToken &cancellation)
+Status WorkerOCServiceImpl::SubmitTopologyFailureCleanup(const cluster::TopologyPhaseAction &action,
+                                                         const cluster::IKeyFilter &filter,
+                                                         const std::string &businessOperationId,
+                                                         std::chrono::steady_clock::time_point deadline,
+                                                         const cluster::CancellationToken &cancellation)
 {
     CHECK_FAIL_RETURN_STATUS(clearDataFlow_ != nullptr, K_NOT_READY, "clear-data flow is not initialized");
     return clearDataFlow_->SubmitTopologyFailureCleanup(action, filter, businessOperationId, deadline, cancellation);
@@ -894,8 +884,8 @@ Status WorkerOCServiceImpl::CloseIncomingMigrationAdmissionAndWait(std::chrono::
 
 Status WorkerOCServiceImpl::MigrateData(const std::vector<std::string> &objectKeys, const std::string &taskId)
 {
-    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
-                          exitRequested_, localAddress_, akSkManager_, objectTable_, taskId);
+    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_, exitRequested_,
+                          localAddress_, akSkManager_, objectTable_, taskId);
     migrator.Init();
     return migrator.Migrate(objectKeys, {});
 }
@@ -904,9 +894,9 @@ Status WorkerOCServiceImpl::MigrateData(const std::vector<std::string> &objectKe
                                         std::chrono::steady_clock::time_point deadline,
                                         const cluster::CancellationToken &cancellation)
 {
-    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
-                          exitRequested_, localAddress_, akSkManager_, objectTable_, taskId,
-                          DataMigrator::UNLIMITED_RETRY_COUNT, deadline, &cancellation);
+    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_, exitRequested_,
+                          localAddress_, akSkManager_, objectTable_, taskId, DataMigrator::UNLIMITED_RETRY_COUNT,
+                          deadline, &cancellation);
     migrator.Init();
     return migrator.Migrate(objectKeys, {});
 }
@@ -914,8 +904,8 @@ Status WorkerOCServiceImpl::MigrateData(const std::vector<std::string> &objectKe
 Status WorkerOCServiceImpl::MigrateL2CacheData(const std::vector<std::string> &needMigrateL2CacheIds,
                                                const std::string &taskId)
 {
-    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
-                          exitRequested_, localAddress_, akSkManager_, objectTable_, taskId);
+    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_, exitRequested_,
+                          localAddress_, akSkManager_, objectTable_, taskId);
     migrator.Init();
     return migrator.MigrateL2CacheBySlot(needMigrateL2CacheIds);
 }
@@ -925,9 +915,9 @@ Status WorkerOCServiceImpl::MigrateL2CacheData(const std::vector<std::string> &n
                                                std::chrono::steady_clock::time_point deadline,
                                                const cluster::CancellationToken &cancellation)
 {
-    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_,
-                          exitRequested_, localAddress_, akSkManager_, objectTable_, taskId,
-                          DataMigrator::UNLIMITED_RETRY_COUNT, deadline, &cancellation);
+    DataMigrator migrator(MigrateType::SCALE_DOWN, metadataRoute_, membership_, endpointPolicy_, exitRequested_,
+                          localAddress_, akSkManager_, objectTable_, taskId, DataMigrator::UNLIMITED_RETRY_COUNT,
+                          deadline, &cancellation);
     migrator.Init();
     return migrator.MigrateL2CacheBySlot(needMigrateL2CacheIds);
 }
@@ -1114,8 +1104,7 @@ Status WorkerOCServiceImpl::RecoverMetadataOfRestartedWorker(const std::string &
     selector.Select(
         [this, &restartedAddress](const std::string &objectKey) {
             HostPort metadataOwner;
-            return metadataRoute_.ResolveOwner(objectKey, metadataOwner).IsOk()
-                   && metadataOwner == restartedAddress;
+            return metadataRoute_.ResolveOwner(objectKey, metadataOwner).IsOk() && metadataOwner == restartedAddress;
         },
         true, matchObjIds);
     RETURN_OK_IF_TRUE(matchObjIds.empty());
@@ -1373,8 +1362,7 @@ Status WorkerOCServiceImpl::ReconciliationIncrRef(const HostPort &sourceMasterAd
 }
 
 Status WorkerOCServiceImpl::ReconcileGlobalRefsWithSourceMaster(
-    const PushMetaToWorkerReqPb &req,
-    const std::unordered_map<std::string, std::unordered_set<ClientKey>> &refTable,
+    const PushMetaToWorkerReqPb &req, const std::unordered_map<std::string, std::unordered_set<ClientKey>> &refTable,
     const std::vector<std::string> &needDelGrefIds)
 {
     HostPort sourceMasterAddr;
@@ -2481,19 +2469,19 @@ Status WorkerOCServiceImpl::GetDeviceObject(
         FormatString("RPC deadline exceeded before dispatch, remaining %ld us.", remainingUs));
     std::string traceID = Trace::Instance().GetTraceID();
     auto dispatchTime = std::chrono::steady_clock::now();
-    threadPool_->Execute([objectKeys, serverApi, subTimeout, clientId, remainingUs, dispatchTime, this,
-                          traceID]() mutable {
-        TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceID);
-        LOG(INFO) << "Processing GetDeviceObject, threads Statistics: " << threadPool_->GetStatistics();
-        auto initRc = InitTimeoutsFromDispatch(remainingUs, dispatchTime);
-        if (initRc.IsError()) {
-            LOG(ERROR) << initRc.GetMsg();
-            LOG_IF_ERROR(serverApi->SendStatus(initRc), "Send status failed");
-            return;
-        }
-        workerDevOcManager_->ProcessGetDeviceObjectRequest(objectKeys, serverApi, subTimeout, clientId);
-        LOG(INFO) << "Process GetDeviceObject done, threads Statistics: " << threadPool_->GetStatistics();
-    });
+    threadPool_->Execute(
+        [objectKeys, serverApi, subTimeout, clientId, remainingUs, dispatchTime, this, traceID]() mutable {
+            TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceID);
+            LOG(INFO) << "Processing GetDeviceObject, threads Statistics: " << threadPool_->GetStatistics();
+            auto initRc = InitTimeoutsFromDispatch(remainingUs, dispatchTime);
+            if (initRc.IsError()) {
+                LOG(ERROR) << initRc.GetMsg();
+                LOG_IF_ERROR(serverApi->SendStatus(initRc), "Send status failed");
+                return;
+            }
+            workerDevOcManager_->ProcessGetDeviceObjectRequest(objectKeys, serverApi, subTimeout, clientId);
+            LOG(INFO) << "Process GetDeviceObject done, threads Statistics: " << threadPool_->GetStatistics();
+        });
     return Status::OK();
 }
 
@@ -2659,8 +2647,7 @@ Status WorkerOCServiceImpl::RecvRootInfo(
             LOG_IF_ERROR(serverApi->SendStatus(initRc), "Send status failed");
             return;
         }
-        LOG_IF_ERROR(workerDevOcManager_->ProcessRecvRootInfoRequest(req, serverApi),
-                     "Process RecvRootInfo failed");
+        LOG_IF_ERROR(workerDevOcManager_->ProcessRecvRootInfoRequest(req, serverApi), "Process RecvRootInfo failed");
         LOG(INFO) << "Process RecvRootInfo done";
     });
     return Status::OK();

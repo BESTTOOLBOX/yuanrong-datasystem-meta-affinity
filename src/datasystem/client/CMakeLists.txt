@@ -18,6 +18,7 @@ list(APPEND CLIENT_SRCS
         object_cache/exist_handler.cpp
         object_cache/object_client.cpp
         object_cache/object_client_impl.cpp
+        object_cache/meta_affinity/meta_affinity_client_ring_source.cpp
         object_cache/client_memory_ref_table.cpp
         object_cache/device/client_device_object_manager.cpp
         object_cache/device/p2p_subscribe.cpp
@@ -98,6 +99,7 @@ list(APPEND CLIENT_DEPEND_LIBS
         client_mmap_static
         gRPC::grpc++
         common_etcd_client
+        common_read_only_hash_ring_view
         worker_transport_api
         cluster_topology_protos_client)
 
