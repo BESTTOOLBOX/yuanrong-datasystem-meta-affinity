@@ -18,9 +18,9 @@
  * Description: Data system Object Client implementation.
  */
 
-#include "datasystem/client/object_cache/meta_affinity/meta_affinity_client_ring_source.h"
 #include "datasystem/client/object_cache/object_client_impl.h"
 
+#include "datasystem/client/object_cache/meta_affinity/meta_affinity_client_ring_source.h"
 #include "datasystem/protos/object_posix.brpc.stub.pb.h"
 
 #include <algorithm>
@@ -110,7 +110,6 @@ const std::string CLIENT_MEMORY_COPY_THREAD_NUM_ENV = "CLIENT_MEMORY_COPY_THREAD
 const std::string CLIENT_MEMORY_COPY_THREAD_NUM_PER_KEY_ENV = "CLIENT_MEMORY_COPY_THREAD_NUM_PER_KEY";
 const std::string CLIENT_MEMCOPY_PARALLEL_THRESHOLD_ENV = "CLIENT_MEMCOPY_PARALLEL_THRESHOLD";
 static constexpr int SHM_REF_RECONCILE_INTERVAL_MS = 5 * 1000;
-
 
 constexpr double US_PER_MS = 1000.0;
 
@@ -497,8 +496,8 @@ Status ObjectClientImpl::InitClientWorkerConnectAt(WorkerNode node, const HostPo
     }
     workerApi_[node]->isUseStandbyWorker_ = node != LOCAL_WORKER;
     int32_t initAttemptTimeoutMs = connectTimeoutMs == connectTimeoutMs_ ? -1 : connectTimeoutMs;
-    RETURN_IF_NOT_OK(workerApi_[node]->Init(requestTimeoutMs_, connectTimeoutMs_, fastTransportMemSize_,
-                                            initAttemptTimeoutMs));
+    RETURN_IF_NOT_OK(
+        workerApi_[node]->Init(requestTimeoutMs_, connectTimeoutMs_, fastTransportMemSize_, initAttemptTimeoutMs));
     ConfigureUrmaDataPlaneFailureCallback(node, workerApi_[node]);
     return Status::OK();
 }
@@ -618,8 +617,8 @@ Status ObjectClientImpl::InitPreferredRemoteFallback(const HostPort &remoteAddre
                                                      int32_t connectTimeoutMs)
 {
     CHECK_FAIL_RETURN_STATUS(connectTimeoutMs >= 0, K_INVALID, "The connection timeout must be a positive integer.");
-    RETURN_IF_NOT_OK(InitClientWorkerConnectAt(STANDBY1_WORKER, remoteAddress, enableHeartbeat, false,
-                                               connectTimeoutMs));
+    RETURN_IF_NOT_OK(
+        InitClientWorkerConnectAt(STANDBY1_WORKER, remoteAddress, enableHeartbeat, false, connectTimeoutMs));
     currentNode_ = STANDBY1_WORKER;
     RETURN_IF_NOT_OK(InitClientRuntimeAt(STANDBY1_WORKER, false, false));
     LOG(INFO) << "[Switch] Preferred same-node local worker is absent, use remote fallback "
@@ -738,10 +737,9 @@ Status ObjectClientImpl::InitWithServiceDiscovery(bool enableHeartbeat)
             CHECK_FAIL_RETURN_STATUS(++retryTimes < INIT_SELECT_WORKER_TRIES, K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
             remainTimeMs = static_cast<int32_t>(timer.GetRemainingTimeMs());
             CHECK_FAIL_RETURN_STATUS(remainTimeMs > 0, K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(
-                    std::min(remainTimeMs, isNoAvailableWorker ? INIT_SELECT_WORKER_NO_WORKER_RETRY_INTERVAL_MS
-                                                               : INIT_SELECT_WORKER_RETRY_INTERVAL_MS)));
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::min(remainTimeMs, isNoAvailableWorker ? INIT_SELECT_WORKER_NO_WORKER_RETRY_INTERVAL_MS
+                                                           : INIT_SELECT_WORKER_RETRY_INTERVAL_MS)));
             remainTimeMs = static_cast<int32_t>(timer.GetRemainingTimeMs());
             continue;
         }
@@ -2155,9 +2153,9 @@ Status ObjectClientImpl::CreateShmBuffer(const std::string &objectKey, uint64_t 
         const double elapsedMs = static_cast<double>(elapsedUs) / US_PER_MS;
         SLOW_LOG_IF_OR_VLOG(INFO, config.rpcSlowerThanUs > 0 && elapsedUs >= config.rpcSlowerThanUs, 1,
                             FormatString("Finished creating object to worker, object_key: %s, path: %s, cost: %.3fms, "
-                                         "rc: %s", objectKey,
-                                         IsUrmaEnabled() && urmaDataInfo != nullptr ? "UB" : "SHM", elapsedMs,
-                                         rc.ToString()));
+                                         "rc: %s",
+                                         objectKey, IsUrmaEnabled() && urmaDataInfo != nullptr ? "UB" : "SHM",
+                                         elapsedMs, rc.ToString()));
         RETURN_IF_NOT_OK(rc);
         std::shared_ptr<ObjectBufferInfo> bufferInfo = nullptr;
         std::shared_ptr<client::IMmapTableEntry> mmapEntry = nullptr;
@@ -2384,8 +2382,7 @@ Status ObjectClientImpl::UpdateConfig(const std::string &configJson)
         if (g_hasKvClientProcessConfig) {
             auto it = g_kvClientProcessConfig.find("monitor_config_file");
             if (it != g_kvClientProcessConfig.end() && !it->second.empty()) {
-                const std::string reason =
-                    "UpdateConfig: MonitorConfigPath must be empty when using UpdateConfig API";
+                const std::string reason = "UpdateConfig: MonitorConfigPath must be empty when using UpdateConfig API";
                 OperationLogger::Instance().LogConfigFailed("UpdateConfig", reason);
                 return Status(StatusCode::K_INVALID, reason);
             }
@@ -2454,10 +2451,10 @@ Status ObjectClientImpl::Publish(const std::shared_ptr<ObjectBufferInfo> &buffer
     }
     const auto elapsedUs = static_cast<uint64_t>(timer.ElapsedMicroSecond());
     const double elapsedMs = static_cast<double>(elapsedUs) / US_PER_MS;
-    SLOW_LOG_IF_OR_VLOG(INFO, config.rpcSlowerThanUs > 0 && elapsedUs >= config.rpcSlowerThanUs, 1,
-        FormatString("Finished publishing object to worker, object_key: %s, path: %s, cost: %.3fms, rc: %s",
-                     objectKey, isShm ? "SHM" : (bufferInfo->ubUrmaDataInfo != nullptr ? "UB" : "TCP"),
-                     elapsedMs, rc.ToString()));
+    SLOW_LOG_IF_OR_VLOG(
+        INFO, config.rpcSlowerThanUs > 0 && elapsedUs >= config.rpcSlowerThanUs, 1,
+        FormatString("Finished publishing object to worker, object_key: %s, path: %s, cost: %.3fms, rc: %s", objectKey,
+                     isShm ? "SHM" : (bufferInfo->ubUrmaDataInfo != nullptr ? "UB" : "TCP"), elapsedMs, rc.ToString()));
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(rc, FormatString("Publish object %s", objectKey));
     return Status::OK();
 }
@@ -2534,7 +2531,7 @@ Status ObjectClientImpl::ProcessShmPut(const std::string &objectKey, const uint8
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_START);
     }
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerApi->Publish(objInfo, !urmaDataInfo || objInfo->ubDataSentByMemoryCopy,
-                                                         false, nestedObjectKeys, ttlSecond, existence),
+                                                        false, nestedObjectKeys, ttlSecond, existence),
                                      FormatString("Put object %s", objectKey));
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::CLIENT_PUBLISH_RPC_END);
@@ -3039,8 +3036,7 @@ std::shared_ptr<ObjectBufferInfo> ObjectClientImpl::MakeObjectBufferInfo(
 // Remove UB placeholder payload entries and clear their part_index references.
 // Used when UB buffer overflow is detected to prevent downstream code from
 // accessing removed payload entries via dangling part_index values.
-static void ClearUBPayloadPlaceholders(GetRspPb &rsp, std::vector<RpcMessage> &payloads,
-                                       size_t origPayloadSize)
+static void ClearUBPayloadPlaceholders(GetRspPb &rsp, std::vector<RpcMessage> &payloads, size_t origPayloadSize)
 {
     payloads.resize(origPayloadSize);
     for (int k = 0; k < rsp.payload_info_size(); ++k) {
@@ -3153,13 +3149,13 @@ Status ObjectClientImpl::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> 
         size_t origPayloadSize = payloads.size();
         for (int i = 0; i < rsp.payload_info_size(); ++i) {
             auto *pi = rsp.mutable_payload_info(i);
-            if (pi->part_index_size() != 0) continue;
+            if (pi->part_index_size() != 0)
+                continue;
 
             uint64_t dataSize = static_cast<uint64_t>(pi->data_size());
             if (ubReadOffset > ubSize || dataSize > ubSize - ubReadOffset) {
-                LOG(ERROR) << "UB payload overflow, object " << pi->object_key()
-                           << ", size " << dataSize << ", consumed " << ubReadOffset
-                           << ", buffer " << ubSize;
+                LOG(ERROR) << "UB payload overflow, object " << pi->object_key() << ", size " << dataSize
+                           << ", consumed " << ubReadOffset << ", buffer " << ubSize;
                 ClearUBPayloadPlaceholders(rsp, payloads, origPayloadSize);
                 ubHandle.reset();
                 ubBufferInfos.clear();
@@ -3168,16 +3164,13 @@ Status ObjectClientImpl::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> 
             payloads.emplace_back();
             pi->add_part_index(payloads.size() - 1);
 
-            std::string mapKey = pi->object_key().empty()
-                ? objectsNeedToGet[pi->object_index()]
-                : pi->object_key();
+            std::string mapKey = pi->object_key().empty() ? objectsNeedToGet[pi->object_index()] : pi->object_key();
             FullParam param;
             param.writeMode = WriteMode(pi->write_mode());
             param.consistencyType = ConsistencyType(pi->consistency_type());
             param.cacheType = CacheType(pi->cache_type());
-            auto bufferInfo = MakeObjectBufferInfo(
-                mapKey, ubPtr + ubReadOffset, dataSize, 0, param,
-                pi->is_seal(), version, {}, nullptr, nullptr, nullptr);
+            auto bufferInfo = MakeObjectBufferInfo(mapKey, ubPtr + ubReadOffset, dataSize, 0, param, pi->is_seal(),
+                                                   version, {}, nullptr, nullptr, nullptr);
             bufferInfo->ubGetBufferHandle = std::shared_ptr<void>(ubHandle, ubHandle.get());
             ubBufferInfos[mapKey] = std::move(bufferInfo);
             ubReadOffset += dataSize;
@@ -3187,8 +3180,8 @@ Status ObjectClientImpl::GetBuffersFromWorker(std::shared_ptr<IClientWorkerApi> 
 
     std::vector<std::string> failedObjectKey;
     failedObjectKey.reserve(objectsNeedToGet.size());
-    RETURN_IF_NOT_OK(ProcessGetResponse(objectsNeedToGet, readParams, rsp, version, payloads,
-        buffers, failedObjectKey, ubBufferInfos));
+    RETURN_IF_NOT_OK(ProcessGetResponse(objectsNeedToGet, readParams, rsp, version, payloads, buffers, failedObjectKey,
+                                        ubBufferInfos));
 
     if (objectsNeedToGet.size() > failedObjectKey.size()) {
         totalPoint.Record();
@@ -3328,13 +3321,11 @@ Status ObjectClientImpl::GetBuffersFromWorkerBatched(std::shared_ptr<IClientWork
 }
 #endif
 
-Status ObjectClientImpl::ProcessGetResponse(const std::vector<std::string> &objectKeys,
-                                            const std::vector<ReadParam> &readParams, GetRspPb &rsp,
-                                            uint32_t version, std::vector<RpcMessage> &payloads,
-                                            std::vector<std::shared_ptr<Buffer>> &buffers,
-                                            std::vector<std::string> &failedObjectKey,
-                                            const std::unordered_map<std::string,
-                                                std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos)
+Status ObjectClientImpl::ProcessGetResponse(
+    const std::vector<std::string> &objectKeys, const std::vector<ReadParam> &readParams, GetRspPb &rsp,
+    uint32_t version, std::vector<RpcMessage> &payloads, std::vector<std::shared_ptr<Buffer>> &buffers,
+    std::vector<std::string> &failedObjectKey,
+    const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos)
 {
     size_t shmCount = static_cast<size_t>(rsp.objects().size());
     size_t noShmCount = static_cast<size_t>(rsp.payload_info().size());
@@ -3349,8 +3340,8 @@ Status ObjectClientImpl::ProcessGetResponse(const std::vector<std::string> &obje
     }
     CHECK_FAIL_RETURN_STATUS(shmCount + noShmCount == objectKeys.size() && payloadSum == payloads.size(),
                              K_UNKNOWN_ERROR, "The response count in GetRspPb does not match with objects count.");
-    RETURN_IF_NOT_OK(GetObjectBuffers(objectKeys, rsp, version, readParams, payloads, buffers, failedObjectKey,
-                                      ubBufferInfos));
+    RETURN_IF_NOT_OK(
+        GetObjectBuffers(objectKeys, rsp, version, readParams, payloads, buffers, failedObjectKey, ubBufferInfos));
 
     Status recvRc(static_cast<StatusCode>(rsp.last_rc().error_code()), rsp.last_rc().error_msg());
     if (recvRc.IsError()) {
@@ -3362,13 +3353,11 @@ Status ObjectClientImpl::ProcessGetResponse(const std::vector<std::string> &obje
     return Status::OK();
 }
 
-Status ObjectClientImpl::GetObjectBuffers(const std::vector<std::string> &objectsNeedToGet, const GetRspPb &rsp,
-                                          uint32_t version, const std::vector<ReadParam> &readParams,
-                                          std::vector<RpcMessage> &payloads,
-                                          std::vector<std::shared_ptr<Buffer>> &buffers,
-                                          std::vector<std::string> &failedObjectKey,
-                                          const std::unordered_map<std::string,
-                                              std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos)
+Status ObjectClientImpl::GetObjectBuffers(
+    const std::vector<std::string> &objectsNeedToGet, const GetRspPb &rsp, uint32_t version,
+    const std::vector<ReadParam> &readParams, std::vector<RpcMessage> &payloads,
+    std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedObjectKey,
+    const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos)
 {
     size_t i = 0;
     size_t j = 0;
@@ -3408,8 +3397,8 @@ Status ObjectClientImpl::GetObjectBuffers(const std::vector<std::string> &object
             const GetRspPb::PayloadInfoPb &payloadInfo = rsp.payload_info(j);
             auto it = ubBufferInfos.find(objectKey);
             status = (it != ubBufferInfos.end())
-                ? Buffer::CreateBuffer(it->second, shared_from_this(), bufferPtr)
-                : SetNonShmObjectBuffer(objectKey, payloadInfo, version, payloads, bufferPtr);
+                         ? Buffer::CreateBuffer(it->second, shared_from_this(), bufferPtr)
+                         : SetNonShmObjectBuffer(objectKey, payloadInfo, version, payloads, bufferPtr);
             j++;
         } else {
             RETURN_STATUS(K_UNKNOWN_ERROR, "Object key does not match with GetRspPb");
@@ -4105,9 +4094,7 @@ Status ObjectClientImpl::MSetCreateCopyAndPublish(const std::vector<std::string>
     AccessTransportTracker::Record(requestTransportKind);
     point.RecordAndReset(PerfKey::CLIENT_MSET_MULTI_PUBLISH);
     MultiPublishRspPb rsp;
-    PublishParam publishParam{
-        .isReplica = false, .existence = param.existence, .ttlSecond = param.ttlSecond
-    };
+    PublishParam publishParam{ .isReplica = false, .existence = param.existence, .ttlSecond = param.ttlSecond };
     RETURN_IF_NOT_OK(workerApi->MultiPublish(bufferInfoList, publishParam, rsp));
     point.RecordAndReset(PerfKey::CLIENT_MSET_POST_PROCESS);
     auto status = HandleShmRefCountAfterMultiPublish(bufferList, rsp);
@@ -4324,9 +4311,7 @@ Status ObjectClientImpl::MultiPublish(const std::vector<std::shared_ptr<Buffer>>
     RETURN_IF_NOT_OK(IsClientReady());
     RETURN_IF_NOT_OK(CheckConnection());
 
-    PublishParam param{
-        .isReplica = true, .existence = setParam.existence, .ttlSecond = setParam.ttlSecond
-    };
+    PublishParam param{ .isReplica = true, .existence = setParam.existence, .ttlSecond = setParam.ttlSecond };
     MultiPublishRspPb rsp;
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
@@ -4742,8 +4727,8 @@ Status ObjectClientImpl::Exist(const std::vector<std::string> &keys, std::vector
     const double elapsedMs = static_cast<double>(elapsedUs) / US_PER_MS;
     const auto &firstKey = keys.empty() ? "" : keys[0];
     SLOW_LOG_IF_OR_VLOG(INFO, config.rpcSlowerThanUs > 0 && elapsedUs >= config.rpcSlowerThanUs, 1,
-        FormatString("Finished check exist from worker, first object_key: %s, cost: %.3fms, rc: %s",
-                     firstKey, elapsedMs, rc.ToString()));
+                        FormatString("Finished check exist from worker, first object_key: %s, cost: %.3fms, rc: %s",
+                                     firstKey, elapsedMs, rc.ToString()));
     return rc;
 }
 
