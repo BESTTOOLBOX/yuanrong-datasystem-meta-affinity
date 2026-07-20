@@ -18,6 +18,7 @@
 #define DATASYSTEM_WORKER_OBJECT_CACHE_META_AFFINITY_REPLICATE_MANAGER_H
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -41,7 +42,10 @@ public:
         }
     }
 
-    ~MetaAffinityReplicateManager() { Stop(); }
+    ~MetaAffinityReplicateManager()
+    {
+        Stop();
+    }
 
     MetaAffinityReplicateManager(const MetaAffinityReplicateManager &) = delete;
     MetaAffinityReplicateManager &operator=(const MetaAffinityReplicateManager &) = delete;
@@ -52,16 +56,24 @@ public:
 
     Status AddTask(MetaAffinityReplicateTask &&task);
 
+    size_t GetQueueDepth() const;
+
+    int GetInFlightCount() const;
+
 private:
     static constexpr size_t kQueueNum = 4;
+    static constexpr std::chrono::milliseconds kStopDrainTimeout{ 30000 };
+    static constexpr std::chrono::milliseconds kStopPollInterval{ 10 };
 
     Status Execute(int threadNum);
     size_t ObjectKey2QueueIndex(const std::string &objectKey) const;
+    bool TryPopTask(int threadNum, MetaAffinityReplicateTask &task);
 
     std::vector<std::unique_ptr<std::mutex>> locks_;
     std::vector<std::deque<MetaAffinityReplicateTask>> queues_;
     std::vector<Thread> threadPool_;
     std::atomic<bool> running_{ false };
+    std::atomic<int> inFlight_{ 0 };
     std::function<void(MetaAffinityReplicateTask &&task)> replicateFunc_;
 };
 

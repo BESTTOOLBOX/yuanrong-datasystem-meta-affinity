@@ -264,6 +264,9 @@ WorkerOCServiceImpl::WorkerOCServiceImpl(HostPort serverAddr, HostPort masterAdd
 WorkerOCServiceImpl::~WorkerOCServiceImpl()
 {
     LOG(INFO) << "WorkerOCServiceImpl exit";
+    if (publishProc_ != nullptr) {
+        publishProc_->StopMetaAffinityReplicate();
+    }
     // Ensure that initOk_.set_value() is called to avoid suspension when MasterLocalWorkerOCApi inits.
     if (!setValue_) {
         initOk_.set_value(Status(K_RUNTIME_ERROR, "WorkerOCServiceImpl init fail"));

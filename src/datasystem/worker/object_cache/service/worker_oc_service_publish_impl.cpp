@@ -28,6 +28,7 @@
 #include "datasystem/common/perf/perf_manager.h"
 #include "datasystem/common/string_intern/string_ref.h"
 #include "datasystem/common/log/trace.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/util/deadlock_util.h"
 #include "datasystem/common/util/format.h"
 #include "datasystem/common/util/raii.h"
@@ -111,7 +112,16 @@ void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicateIfNeeded(const Obj
         .dataFormat = static_cast<uint32_t>(safeObj->stateInfo.GetDataFormat()),
     };
     MetaAffinityReplicateTask task(std::move(param));
-    (void)metaAffinityReplicateManager_->AddTask(std::move(task));
+    if (metaAffinityReplicateManager_->AddTask(std::move(task)).IsOk()) {
+        METRIC_INC(metrics::KvMetricId::WORKER_META_AFFINITY_REPLICATE_SCHEDULED_TOTAL);
+    }
+}
+
+void WorkerOcServicePublishImpl::StopMetaAffinityReplicate()
+{
+    if (metaAffinityReplicateManager_ != nullptr) {
+        metaAffinityReplicateManager_->Stop();
+    }
 }
 
 Status WorkerOcServicePublishImpl::VertifyObjectReleaseValidity(const PublishReqPb &req, const SafeObjType &safeObj)

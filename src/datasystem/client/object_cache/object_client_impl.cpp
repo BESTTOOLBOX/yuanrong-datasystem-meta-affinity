@@ -54,6 +54,7 @@
 #include "datasystem/common/metrics/metrics.h"
 #include "datasystem/common/object_cache/buffer_composer.h"
 #include "datasystem/common/object_cache/object_base.h"
+#include "datasystem/common/rpc/api_deadline.h"
 #include "datasystem/common/rpc/rpc_auth_key_manager.h"
 #include "datasystem/common/log/latency_phase.h"
 #include "datasystem/common/log/log.h"
@@ -2603,6 +2604,7 @@ Status ObjectClientImpl::Put(const std::string &objectKey, const uint8_t *data, 
                              const std::unordered_set<std::string> &nestedObjectKeys, uint32_t ttlSecond, int existence)
 {
     std::shared_lock<std::shared_timed_mutex> shutdownLck(shutdownMux_);
+    ApiDeadlineGuard deadlineGuard(requestTimeoutMs_);
     RETURN_IF_NOT_OK(IsClientReady());
     PerfPoint perfPoint(PerfKey::CLIENT_PUT_OBJECT);
     CHECK_FAIL_RETURN_STATUS(!objectKey.empty(), K_INVALID, "The objectKey should not be empty.");

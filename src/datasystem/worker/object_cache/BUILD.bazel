@@ -164,6 +164,7 @@ ds_cc_library(
     ],
     deps = [
         "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/metrics:kv_metrics",
         "//src/datasystem/common/util:thread",
     ],
 )
@@ -182,8 +183,10 @@ ds_cc_library(
         "//src/datasystem/common/flags:ds_flags",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/metrics:kv_metrics",
         "//src/datasystem/common/util:format",
         "//src/datasystem/common/util:status_helper",
+        "//src/datasystem/common/util:timer",
         "//src/datasystem/master:meta_addr_info",
         "//src/datasystem/protos:master_object_cc_proto",
         "//src/datasystem/worker/cluster_manager:cluster_manager_header",

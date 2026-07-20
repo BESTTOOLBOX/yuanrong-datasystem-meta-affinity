@@ -18,10 +18,12 @@
 #include "datasystem/worker/object_cache/meta_affinity_replicate_manager.h"
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <thread>
 #include <vector>
 
 #include "datasystem/common/flags/flags.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "ut/common.h"
 
 DS_DECLARE_bool(enable_meta_affinity_replicate);
@@ -37,6 +39,7 @@ public:
     {
         CommonTest::SetUp();
         oldFlag_ = FLAGS_enable_meta_affinity_replicate;
+        DS_ASSERT_OK(metrics::InitKvMetrics());
     }
 
     void TearDown() override
@@ -97,6 +100,24 @@ TEST_F(MetaAffinityReplicateTest, ManagerExecutesQueuedTask)
         ASSERT_EQ(executed.size(), 1u);
         EXPECT_EQ(executed.front(), "obj-a");
     }
+}
+
+TEST_F(MetaAffinityReplicateTest, ManagerDrainsQueueOnStop)
+{
+    MetaAffinityReplicateManager manager;
+    std::atomic<int> executedCount{ 0 };
+    DS_ASSERT_OK(manager.Init([&](MetaAffinityReplicateTask &&task) {
+        (void)task;
+        executedCount.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }));
+
+    MetaAffinityReplicateParam param{ .objectKey = "obj-drain", .version = 1, .dataFormat = 1 };
+    DS_ASSERT_OK(manager.AddTask(MetaAffinityReplicateTask(std::move(param))));
+    manager.Stop();
+    EXPECT_EQ(executedCount.load(), 1);
+    EXPECT_EQ(manager.GetQueueDepth(), 0u);
+    EXPECT_EQ(manager.GetInFlightCount(), 0);
 }
 
 }  // namespace ut

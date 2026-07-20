@@ -22,8 +22,10 @@
 #include "datasystem/common/immutable_string/immutable_string.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/log/log.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/util/format.h"
 #include "datasystem/common/util/status_helper.h"
+#include "datasystem/common/util/timer.h"
 #include "datasystem/object/object_enum.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/worker/object_cache/data_migrator/data_migrator.h"
@@ -33,6 +35,17 @@ DS_DECLARE_bool(enable_meta_affinity_replicate);
 namespace datasystem {
 namespace object_cache {
 namespace {
+
+enum class MetaAffinityReplicateStage { MIGRATE, REPLACE_PRIMARY };
+
+void RecordMetaAffinityReplicateFailure(MetaAffinityReplicateStage stage, const std::string &objectKey,
+                                        const std::string &metaWorkerAddr, const Status &status)
+{
+    METRIC_INC(metrics::KvMetricId::WORKER_META_AFFINITY_REPLICATE_FAILURE_TOTAL);
+    LOG(WARNING) << FormatString("[MetaAffinityReplicate] stage=%s object=%s meta_owner=%s status=%s",
+                                 stage == MetaAffinityReplicateStage::MIGRATE ? "migrate" : "replace_primary",
+                                 objectKey, metaWorkerAddr, status.ToString());
+}
 
 bool MetaMovingDone(const master::ReplacePrimaryRspPb &rsp)
 {
@@ -118,6 +131,7 @@ Status ExecuteMetaAffinityReplicate(const MetaAffinityReplicateParam &param, con
         return Status(K_INVALID, "MetaAffinityReplicateContext is incomplete");
     }
 
+    Timer timer;
     HostPort metaWorker;
     RETURN_IF_NOT_OK(ctx.metadataRouteResolver->ResolveOwner(param.objectKey, metaWorker));
     const std::string metaWorkerAddr = metaWorker.ToString();
@@ -136,22 +150,27 @@ Status ExecuteMetaAffinityReplicate(const MetaAffinityReplicateParam &param, con
     auto future = migrator.MigrateToTargetNode({ param.objectKey }, metaWorker, nullptr, false, 0, false);
     const auto result = future.get();
     if (result.successIds.find(ImmutableString(param.objectKey)) == result.successIds.end()) {
-        LOG(WARNING) << FormatString("[MetaAffinityReplicate] migrate %s to %s failed: %s", param.objectKey,
-                                     metaWorkerAddr, result.status.ToString());
-        return result.status.IsError() ? result.status
-                                       : Status(K_RUNTIME_ERROR, "MetaAffinityReplicate migrate failed");
+        const Status migrateStatus =
+            result.status.IsError() ? result.status : Status(K_RUNTIME_ERROR, "MetaAffinityReplicate migrate failed");
+        RecordMetaAffinityReplicateFailure(MetaAffinityReplicateStage::MIGRATE, param.objectKey, metaWorkerAddr,
+                                           migrateStatus);
+        return migrateStatus;
     }
 
     Status rc = ReplacePrimaryWithRetry(ctx, param.objectKey, param.version, localAddr, metaWorkerAddr);
     if (rc.IsError()) {
-        LOG(WARNING) << FormatString("[MetaAffinityReplicate] ReplacePrimary %s failed: %s", param.objectKey,
-                                     rc.ToString());
+        RecordMetaAffinityReplicateFailure(MetaAffinityReplicateStage::REPLACE_PRIMARY, param.objectKey, metaWorkerAddr,
+                                           rc);
         return rc;
     }
 
     MarkLocalCopyOnOriginWorker(ctx, param.objectKey);
-    LOG(INFO) << FormatString("[MetaAffinityReplicate] object %s primary moved from %s to %s", param.objectKey,
-                              localAddr, metaWorkerAddr);
+    const auto elapsedUs = static_cast<uint64_t>(timer.ElapsedMicroSecond());
+    metrics::GetHistogram(static_cast<uint16_t>(metrics::KvMetricId::WORKER_META_AFFINITY_REPLICATE_LATENCY))
+        .Observe(elapsedUs);
+    METRIC_INC(metrics::KvMetricId::WORKER_META_AFFINITY_REPLICATE_SUCCESS_TOTAL);
+    LOG(INFO) << FormatString("[MetaAffinityReplicate] object %s primary moved from %s to %s in %llu us",
+                              param.objectKey, localAddr, metaWorkerAddr, static_cast<unsigned long long>(elapsedUs));
     return Status::OK();
 }
 

@@ -157,7 +157,7 @@ public:
      * @return K_OK on success; the error code otherwise.
      */
     Status SendBufferViaUb(const std::shared_ptr<ObjectBufferInfo> &bufferInfo, const void *data, uint64_t length,
-                          bool traceEnabled);
+                           bool traceEnabled);
 
     /**
      * @brief Invoke worker client to publish all buffers of all the given object keys.
@@ -884,11 +884,11 @@ private:
      * @param[out] failedObjectKey The vector of failed object keys.
      * @return Status of the result.
      */
-    Status ProcessGetResponse(const std::vector<std::string> &objectKeys, const std::vector<ReadParam> &readParams,
-                              GetRspPb &rsp, uint32_t version, std::vector<RpcMessage> &payloads,
-                              std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedObjectKey,
-                              const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>>
-                                  &ubBufferInfos = {});
+    Status ProcessGetResponse(
+        const std::vector<std::string> &objectKeys, const std::vector<ReadParam> &readParams, GetRspPb &rsp,
+        uint32_t version, std::vector<RpcMessage> &payloads, std::vector<std::shared_ptr<Buffer>> &buffers,
+        std::vector<std::string> &failedObjectKey,
+        const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos = {});
 
     /**
      * @brief Get shared memory data buffers from worker.
@@ -900,11 +900,11 @@ private:
      * @param[out] failedObjectKey The vector of the failed to get object key list.
      * @return Status of the result.
      */
-    Status GetObjectBuffers(const std::vector<std::string> &objectsNeedToGet, const GetRspPb &rsp, uint32_t version,
-                            const std::vector<ReadParam> &readParams, std::vector<RpcMessage> &payloads,
-                            std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedObjectKey,
-                            const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>>
-                                &ubBufferInfos = {});
+    Status GetObjectBuffers(
+        const std::vector<std::string> &objectsNeedToGet, const GetRspPb &rsp, uint32_t version,
+        const std::vector<ReadParam> &readParams, std::vector<RpcMessage> &payloads,
+        std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedObjectKey,
+        const std::unordered_map<std::string, std::shared_ptr<ObjectBufferInfo>> &ubBufferInfos = {});
     /**
      * @brief Fill in buffer for non-shm cases.
      * @param[in] objectKey The object key of the cache object.
@@ -1131,8 +1131,7 @@ private:
      * @return SWITCHED on success, ABORT if the switch was aborted, CONTINUE if all candidates failed.
      */
     StandbySwitchAttemptResult TrySwitchToCandidateList(const std::shared_ptr<IClientWorkerApi> &currentApi,
-                                                        WorkerNode current, WorkerNode next,
-                                                        uint64_t switchGeneration,
+                                                        WorkerNode current, WorkerNode next, uint64_t switchGeneration,
                                                         const std::vector<HostPort> &candidates, bool isSameHost);
 
     void MarkNoSwitchableWorkerIfNeeded(WorkerNode current, uint64_t switchGeneration);
@@ -1571,7 +1570,7 @@ private:
     int parallismNum_ = 0;
     uint64_t memcpyParallelThreshold_ = 0;
 
-    std::shared_ptr<ServiceDiscovery> serviceDiscovery_ = nullptr;
+    std::shared_ptr<IServiceDiscovery> serviceDiscovery_ = nullptr;
 
     std::mutex metaAffinityWriteMutex_;
     std::shared_ptr<MetaAffinityClientRingSource> metaAffinityRingSource_;
