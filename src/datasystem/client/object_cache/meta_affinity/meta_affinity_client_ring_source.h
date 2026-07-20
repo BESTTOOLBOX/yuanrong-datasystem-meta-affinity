@@ -24,7 +24,9 @@
 #include <string>
 
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
+#include "datasystem/client/routing/routing_rpc_client.h"
 #include "datasystem/common/ak_sk/signature.h"
+#include "datasystem/common/rpc/rpc_credential.h"
 #include "datasystem/common/kvstore/etcd/etcd_store.h"
 #include "datasystem/common/object_cache/read_only_hash_ring_view.h"
 #include "datasystem/common/util/net_util.h"
@@ -34,8 +36,8 @@ namespace datasystem {
 namespace object_cache {
 class MetaAffinityClientRingSource {
 public:
-    MetaAffinityClientRingSource(std::shared_ptr<IClientWorkerApi> gatewayWorkerApi, Signature *signature,
-                                 int32_t requestTimeoutMs);
+    MetaAffinityClientRingSource(std::shared_ptr<IClientWorkerApi> gatewayWorkerApi, RpcCredential cred,
+                                 Signature *signature, int32_t requestTimeoutMs);
     ~MetaAffinityClientRingSource() = default;
 
     Status BootstrapRing();
@@ -44,13 +46,16 @@ public:
 
 private:
     Status EnsureInitialized();
+    Status EnsureRoutingRpcClient();
     Status LoadFromEtcd();
     Status LoadFromWorker();
 
     std::shared_ptr<IClientWorkerApi> gatewayWorkerApi_;
+    RpcCredential cred_;
     Signature *signature_;
     int32_t requestTimeoutMs_;
     std::shared_ptr<EtcdStore> etcdStore_;
+    std::shared_ptr<client::RoutingRpcClient> routingRpcClient_;
     ReadOnlyHashRingView view_;
 };
 }  // namespace object_cache

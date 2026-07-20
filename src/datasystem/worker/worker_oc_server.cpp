@@ -95,8 +95,8 @@
 
 DS_DECLARE_bool(use_brpc);
 DS_DECLARE_string(coordinator_address);
-DS_DEFINE_string(master_address, "", "Address of ds master and the value cannot be empty.");
-DS_DEFINE_bool(enable_distributed_master, true, "Whether to support distributed master, default is true.");
+DS_DECLARE_string(master_address);
+DS_DECLARE_bool(enable_distributed_master);
 DS_DEFINE_uint32_dynamic(add_node_wait_time_s, 60, "Wait time (s) for the first node joining a working hash ring.");
 DS_DECLARE_bool(auto_del_dead_node);
 DS_DEFINE_bool(enable_p2p_transfer, false, "Heterogeneous object transfer protocol Enables p2ptransfer");
@@ -245,15 +245,14 @@ struct PendingControlBackendProbe {
 };
 
 Status StartControlBackendProbe(const HostPort &localAddress, const std::shared_ptr<AkSkManager> &akSkManager,
-                                const cluster::MemberIdentity &peer,
-                                std::chrono::steady_clock::time_point deadline,
+                                const cluster::MemberIdentity &peer, std::chrono::steady_clock::time_point deadline,
                                 PendingControlBackendProbe &pending)
 {
     const auto now = std::chrono::steady_clock::now();
     CHECK_FAIL_RETURN_STATUS(now < deadline, K_RPC_DEADLINE_EXCEEDED, "cluster-state probe deadline exceeded");
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-    const auto timeout = static_cast<int32_t>(
-        std::min<int64_t>(std::numeric_limits<int32_t>::max(), std::max<int64_t>(remaining, 1)));
+    const auto timeout =
+        static_cast<int32_t>(std::min<int64_t>(std::numeric_limits<int32_t>::max(), std::max<int64_t>(remaining, 1)));
     std::shared_ptr<object_cache::WorkerRemoteWorkerOCApi> api;
     RETURN_IF_NOT_OK(object_cache::CreateRemoteWorkerApi(peer.address, localAddress, akSkManager, api));
     GetClusterStateReqPb request;
@@ -271,8 +270,8 @@ Status FinishControlBackendProbe(const PendingControlBackendProbe &pending,
                              "cluster-state probe deadline exceeded");
     GetClusterStateRspPb response;
     RETURN_IF_NOT_OK(pending.api->GetClusterStateAsyncRead(pending.tag, response));
-    return object_cache::FillControlBackendObservationFromGetClusterStateRspPb(
-        pending.peer.address, response, observation);
+    return object_cache::FillControlBackendObservationFromGetClusterStateRspPb(pending.peer.address, response,
+                                                                               observation);
 }
 
 std::vector<cluster::ControlBackendObservation> ProbeControlBackendPeers(
@@ -772,9 +771,9 @@ void WorkerOCServer::CreateMasterServices()
     commonSvc_ = std::make_unique<MasterServiceImpl>(hostPort_, akSkManager_);
     if (EnableOCService()) {
         // create MasterOCServiceImpl
-        objCacheMasterSvc_ = std::make_unique<MasterOCServiceImpl>(
-            hostPort_, persistenceApi_, akSkManager_, metadataManagerHolder_.get(), resourceManager_.get(),
-            topologyEngine_->Membership(), hostPort_.ToString());
+        objCacheMasterSvc_ = std::make_unique<MasterOCServiceImpl>(hostPort_, persistenceApi_, akSkManager_,
+                                                                   metadataManagerHolder_.get(), resourceManager_.get(),
+                                                                   topologyEngine_->Membership(), hostPort_.ToString());
     }
     if (EnableSCService()) {
         // create MasterSCServiceImpl
@@ -791,9 +790,9 @@ void WorkerOCServer::CreateWorkerServices()
     LOG(INFO) << "Start create worker services";
 
     // create WorkerServiceImpl
-    workerSvc_ = std::make_unique<WorkerServiceImpl>(
-        hostPort_, masterAddr_, DFT_TIMEOUT_MULT, this, akSkManager_, hostPort_.ToString(),
-        topologyEngine_->Membership(), topologyExitRequested_);
+    workerSvc_ = std::make_unique<WorkerServiceImpl>(hostPort_, masterAddr_, DFT_TIMEOUT_MULT, this, akSkManager_,
+                                                     hostPort_.ToString(), topologyEngine_->Membership(),
+                                                     topologyExitRequested_);
     auto objectTable = std::make_shared<ObjectTable>();
     auto evictionManager = std::make_shared<object_cache::WorkerOcEvictionManager>(
         objectTable, hostPort_, masterAddr_, *metadataRouteResolver_, objCacheMasterSvc_.get());
@@ -825,23 +824,23 @@ void WorkerOCServer::CreateObjectCacheWorkerServices(
         objCacheMasterSvc_.get(), topologyEngine_.get(), *metadataRouteResolver_, topologyEngine_->Membership(),
         &topologyExitRequested_, topologyEngine_->IsRestart(), true);
     CreateRebalanceExecutor(objectTable, evictionManager);
-    objCacheClientWorkerSvc_->RegisterAsyncTasksDoneChecker(
-        [this](const std::string &, std::chrono::steady_clock::time_point deadline,
-               const cluster::CancellationToken &cancellation) {
+    objCacheClientWorkerSvc_->RegisterAsyncTasksDoneChecker([this](const std::string &,
+                                                                   std::chrono::steady_clock::time_point deadline,
+                                                                   const cluster::CancellationToken &cancellation) {
         while (!checkAsyncTasksDone_.load()) {
-            CHECK_FAIL_RETURN_STATUS(!cancellation.IsCancelled(), K_NOT_READY,
-                                     "topology async-task drain cancelled");
+            CHECK_FAIL_RETURN_STATUS(!cancellation.IsCancelled(), K_NOT_READY, "topology async-task drain cancelled");
             CHECK_FAIL_RETURN_STATUS(std::chrono::steady_clock::now() < deadline, K_RPC_DEADLINE_EXCEEDED,
                                      "topology async-task drain deadline exceeded");
-            cancellation.WaitUntil(std::min(
-                deadline, std::chrono::steady_clock::now() + std::chrono::seconds(CHECK_ASYNC_SLEEP_TIME_S)));
+            cancellation.WaitUntil(
+                std::min(deadline, std::chrono::steady_clock::now() + std::chrono::seconds(CHECK_ASYNC_SLEEP_TIME_S)));
         }
         return Status::OK();
     });
     // create WorkerWorkerOCService
     objCacheWorkerWkSvc_ = std::make_shared<datasystem::object_cache::WorkerWorkerOCServiceImpl>(
         objCacheClientWorkerSvc_, akSkManager_, topologyEngine_->Membership(),
-        [this] { return topologyEngine_ != nullptr && !topologyEngine_->IsMemberLeaseTimedOut(); }, [this] {
+        [this] { return topologyEngine_ != nullptr && !topologyEngine_->IsMemberLeaseTimedOut(); },
+        [this] {
             return topologyEngine_ == nullptr ? cluster::ControlBackendObservation{}
                                               : topologyEngine_->GetControlBackendObservation();
         });
@@ -995,9 +994,8 @@ Status WorkerOCServer::InitCoordinationBackend()
     RETURN_IF_NOT_OK(etcdStore_->Init());
     RETURN_IF_NOT_OK(
         etcdStore_->Authenticate(FLAGS_etcd_username, FLAGS_etcd_password, FLAGS_etcd_token_refresh_interval_s));
-    RETURN_IF_NOT_OK_EXCEPT(etcdStore_->CreateTable(COORDINATION_MASTER_ADDRESS_TABLE,
-                                                    COORDINATION_MASTER_ADDRESS_TABLE),
-                            K_DUPLICATED);
+    RETURN_IF_NOT_OK_EXCEPT(
+        etcdStore_->CreateTable(COORDINATION_MASTER_ADDRESS_TABLE, COORDINATION_MASTER_ADDRESS_TABLE), K_DUPLICATED);
     return Status::OK();
 }
 
@@ -1055,10 +1053,10 @@ Status WorkerOCServer::ConstructTopologyRuntime()
         .SetSnapshotPublishedHandler([this](std::shared_ptr<const cluster::TopologySnapshot> snapshot) {
             ScheduleTopologySnapshotWarmup(std::move(snapshot));
         })
-        .SetControlBackendProbe([localAddress = hostPort_, akSkManager = akSkManager_](
-                                    const auto &, const auto &peers, auto deadline) {
-            return ProbeControlBackendPeers(localAddress, akSkManager, peers, deadline);
-        })
+        .SetControlBackendProbe(
+            [localAddress = hostPort_, akSkManager = akSkManager_](const auto &, const auto &peers, auto deadline) {
+                return ProbeControlBackendPeers(localAddress, akSkManager, peers, deadline);
+            })
         .SetAvailabilityHandler([](cluster::TopologyAvailabilityLevel level) {
             const bool allowBusiness = level == cluster::TopologyAvailabilityLevel::NORMAL
                                        || level == cluster::TopologyAvailabilityLevel::CONTROL_DEGRADED;
@@ -1078,10 +1076,10 @@ Status WorkerOCServer::ConstructTopologyRuntime()
     metadataRouteOptions.masterAddress = masterAddr_;
     metadataRouteResolver_ =
         std::make_unique<MetadataRouteResolver>(&topologyEngine_->Placement(), std::move(metadataRouteOptions));
-    objectEndpointPolicy_ = std::make_unique<object_cache::ObjectEndpointPolicy>(*metadataRouteResolver_,
-                                                                                 topologyEngine_->Membership());
-    LOG(INFO) << "CLUSTER_LIFECYCLE cluster=" << FLAGS_cluster_name << " role=worker state=constructed local_address="
-              << hostPort_.ToString() << " restart=" << isRestart;
+    objectEndpointPolicy_ =
+        std::make_unique<object_cache::ObjectEndpointPolicy>(*metadataRouteResolver_, topologyEngine_->Membership());
+    LOG(INFO) << "CLUSTER_LIFECYCLE cluster=" << FLAGS_cluster_name
+              << " role=worker state=constructed local_address=" << hostPort_.ToString() << " restart=" << isRestart;
     return Status::OK();
 }
 
@@ -1123,36 +1121,34 @@ Status WorkerOCServer::ResolveCentralMetadataAddress(std::string &address)
     const auto localAddress = hostPort_.ToString();
     if (coordinatorServiceProxy_ == nullptr) {
         CHECK_FAIL_RETURN_STATUS(etcdStore_ != nullptr, K_NOT_READY, "ETCD Store is not initialized");
-        auto rc = etcdStore_->CAS(
-            COORDINATION_MASTER_ADDRESS_TABLE, COORDINATION_MASTER_ADDRESS_KEY, "", localAddress);
+        auto rc = etcdStore_->CAS(COORDINATION_MASTER_ADDRESS_TABLE, COORDINATION_MASTER_ADDRESS_KEY, "", localAddress);
         if (rc.IsOk()) {
             address = localAddress;
             return Status::OK();
         }
         return etcdStore_->Get(COORDINATION_MASTER_ADDRESS_TABLE, COORDINATION_MASTER_ADDRESS_KEY, address);
     }
-    const std::string physicalKey = std::string(COORDINATION_MASTER_ADDRESS_TABLE) + "/"
-                                    + COORDINATION_MASTER_ADDRESS_KEY;
+    const std::string physicalKey =
+        std::string(COORDINATION_MASTER_ADDRESS_TABLE) + "/" + COORDINATION_MASTER_ADDRESS_KEY;
     std::vector<KeyValueEntry> entries;
     int64_t revision = 0;
     std::string coordinatorId;
-    RETURN_IF_NOT_OK(coordinatorServiceProxy_->Range(
-        physicalKey, "", entries, revision, DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, &coordinatorId));
+    RETURN_IF_NOT_OK(coordinatorServiceProxy_->Range(physicalKey, "", entries, revision,
+                                                     DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, &coordinatorId));
     if (!entries.empty()) {
         address = entries.front().value;
         return Status::OK();
     }
     int64_t version = 0;
-    auto rc = coordinatorServiceProxy_->Put(
-        physicalKey, localAddress, 0, COORDINATOR_KEY_NOT_EXISTS_VERSION, version, revision,
-        DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, nullptr, coordinatorId);
+    auto rc = coordinatorServiceProxy_->Put(physicalKey, localAddress, 0, COORDINATOR_KEY_NOT_EXISTS_VERSION, version,
+                                            revision, DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, nullptr, coordinatorId);
     if (rc.IsOk()) {
         address = localAddress;
         return Status::OK();
     }
     entries.clear();
-    RETURN_IF_NOT_OK(coordinatorServiceProxy_->Range(
-        physicalKey, "", entries, revision, DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, nullptr));
+    RETURN_IF_NOT_OK(coordinatorServiceProxy_->Range(physicalKey, "", entries, revision,
+                                                     DEFAULT_COORDINATOR_RPC_TIMEOUT_MS, nullptr));
     CHECK_FAIL_RETURN_STATUS(!entries.empty(), K_NOT_FOUND, "centralized metadata address is absent after CAS");
     address = entries.front().value;
     return Status::OK();
@@ -1278,11 +1274,10 @@ Status WorkerOCServer::InitRpcAndMemoryRuntime()
     uint64_t sharedMemoryBytes = FLAGS_shared_memory_size_mb * 1024ul * 1024ul;  // convert mb to bytes.
     uint64_t sharedDiskBytes = FLAGS_shared_disk_size_mb * 1024ul * 1024ul;      // convert mb to bytes.
     ssize_t decayMs = FLAGS_memory_reclamation_time_second * 1000;               // convert to ms.
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-        datasystem::memory::Allocator::Instance()->Init(
-            sharedMemoryBytes, sharedDiskBytes, FLAGS_shared_memory_populate, true, decayMs,
-            FLAGS_oc_shm_threshold_percentage, FLAGS_sc_shm_threshold_percentage),
-        "Init allocator failed");
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(datasystem::memory::Allocator::Instance()->Init(
+                                         sharedMemoryBytes, sharedDiskBytes, FLAGS_shared_memory_populate, true,
+                                         decayMs, FLAGS_oc_shm_threshold_percentage, FLAGS_sc_shm_threshold_percentage),
+                                     "Init allocator failed");
     // Call base class to init common service
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(CommonServer::Init(), "CommonServer init failed");
     return Status::OK();
@@ -1349,9 +1344,9 @@ Status WorkerOCServer::InitLivenessCheck()
     if (!FLAGS_liveness_check_path.empty()) {
         const int secToMs = 1000;
         // start liveiness check.
-        livenessCheck_ = std::make_unique<WorkerLivenessCheck>(
-            this, FLAGS_liveness_check_path, FLAGS_liveness_probe_timeout_s * secToMs, bindHostPort_,
-            hostPort_.ToString(), akSkManager_);
+        livenessCheck_ = std::make_unique<WorkerLivenessCheck>(this, FLAGS_liveness_check_path,
+                                                               FLAGS_liveness_probe_timeout_s * secToMs, bindHostPort_,
+                                                               hostPort_.ToString(), akSkManager_);
         RETURN_IF_NOT_OK(livenessCheck_->Init());
     }
     return Status::OK();
@@ -1814,9 +1809,9 @@ bool WorkerOCServer::SubmitWorkerMasterRpcWarmupTask(const std::string &masterAd
     return true;
 }
 
-size_t WorkerOCServer::ScheduleWorkerMasterRpcWarmupTasks(
-    const std::vector<const cluster::Member *> &members, const std::unordered_set<std::string> *warmedAddrs,
-    const std::function<void(const std::string &)> &onSuccess)
+size_t WorkerOCServer::ScheduleWorkerMasterRpcWarmupTasks(const std::vector<const cluster::Member *> &members,
+                                                          const std::unordered_set<std::string> *warmedAddrs,
+                                                          const std::function<void(const std::string &)> &onSuccess)
 {
     size_t scheduledCount = 0;
     for (const auto *member : members) {
@@ -1869,8 +1864,8 @@ void WorkerOCServer::WarmupReadyWorkerMasterRpcOnStartup()
                 oldWarmedCount = warmedAddrs->size();
                 warmedSnapshot = *warmedAddrs;
             }
-            auto scheduledCount = ScheduleWorkerMasterRpcWarmupTasks(
-                snapshot->ActiveMembers(), &warmedSnapshot, markWarmupSucceeded);
+            auto scheduledCount =
+                ScheduleWorkerMasterRpcWarmupTasks(snapshot->ActiveMembers(), &warmedSnapshot, markWarmupSucceeded);
             totalScheduledCount += scheduledCount;
             {
                 std::lock_guard<std::mutex> lock(*warmedAddrsMutex);
@@ -1901,8 +1896,7 @@ void WorkerOCServer::WarmupReadyWorkerMasterRpcOnStartup()
         totalScheduledCount, lastWarmedCount, lastDiscoveredCount, elapsedMs);
 }
 
-void WorkerOCServer::ScheduleTopologySnapshotWarmup(
-    std::shared_ptr<const cluster::TopologySnapshot> snapshot)
+void WorkerOCServer::ScheduleTopologySnapshotWarmup(std::shared_ptr<const cluster::TopologySnapshot> snapshot)
 {
     if (!EnableOCService() || snapshot == nullptr || masterRpcWarmupExit_) {
         return;
@@ -1956,8 +1950,7 @@ void WorkerOCServer::WarmupTopologySnapshotMembers(const cluster::TopologySnapsh
             return;
         }
         const auto &address = member->identity.address;
-        if (address == localAddress
-            || (!FLAGS_enable_distributed_master && address != centralizedMasterAddress)) {
+        if (address == localAddress || (!FLAGS_enable_distributed_master && address != centralizedMasterAddress)) {
             continue;
         }
         activeMembers.emplace(address, member->identity.id);
@@ -1994,8 +1987,7 @@ void WorkerOCServer::WarmupTopologySnapshotMembers(const cluster::TopologySnapsh
             << ", failure_count=" << failureCount;
 }
 
-void WorkerOCServer::PruneWorkerMasterRpcWarmupCache(
-    const std::unordered_map<std::string, std::string> &activeMembers)
+void WorkerOCServer::PruneWorkerMasterRpcWarmupCache(const std::unordered_map<std::string, std::string> &activeMembers)
 {
     std::lock_guard<std::mutex> lock(masterRpcWarmupMutex_);
     for (auto iter = warmedMasterRpcMemberIds_.begin(); iter != warmedMasterRpcMemberIds_.end();) {
@@ -2208,8 +2200,7 @@ void WorkerOCServer::WaitForPreShutdownTasks(bool scaleIn)
 {
     std::unique_lock<std::mutex> lock(checkAsyncTasksDoneMutex_);
     auto shouldExit = [this, scaleIn]() {
-        return !scaleIn ? checkAsyncTasksDone_.load()
-                        : checkAsyncTasksDone_.load() && allClientsExited_.load();
+        return !scaleIn ? checkAsyncTasksDone_.load() : checkAsyncTasksDone_.load() && allClientsExited_.load();
     };
     bool waitFlag = false;
     while (!waitFlag) {

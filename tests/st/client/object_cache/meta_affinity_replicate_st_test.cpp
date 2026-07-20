@@ -98,7 +98,9 @@ TEST_F(MetaAffinityReplicateStTest, RemoteOnlyClientPutDirectlyOnMetaOwner)
     ASSERT_EQ(objMetas.size(), 1u);
     EXPECT_EQ(objMetas[0].objSize, payload.size());
     ASSERT_EQ(objMetas[0].locations.size(), 1u);
-    EXPECT_EQ(objMetas[0].locations[0], GetWorkerUuid(1, uuidMap_));
+    const std::string worker1Location = worker1Address_.ToString();
+    const std::string worker1Uuid = GetWorkerUuid(1, uuidMap_);
+    EXPECT_TRUE(objMetas[0].locations[0] == worker1Location || objMetas[0].locations[0] == worker1Uuid);
 
     std::vector<Optional<Buffer>> buffers;
     DS_ASSERT_OK(remoteClient->Get({ objectKey }, 0, buffers));

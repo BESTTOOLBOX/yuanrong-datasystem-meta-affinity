@@ -19,6 +19,7 @@ ds_cc_library(
         "//src/datasystem/client:mmap_manager",
         "//src/datasystem/client:service_discovery",
         "//src/datasystem/client/routing:routing",
+        "//src/datasystem/cluster:cluster_topology",
         "//src/datasystem/client/object_cache/client_worker_api:client_worker_local_api",
         "//src/datasystem/client/object_cache/client_worker_api:client_worker_remote_api",
         "//src/datasystem/client/object_cache/client_worker_api:iclient_worker_api",

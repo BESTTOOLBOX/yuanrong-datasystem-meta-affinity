@@ -117,13 +117,6 @@ void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicateIfNeeded(const Obj
     }
 }
 
-void WorkerOcServicePublishImpl::StopMetaAffinityReplicate()
-{
-    if (metaAffinityReplicateManager_ != nullptr) {
-        metaAffinityReplicateManager_->Stop();
-    }
-}
-
 Status WorkerOcServicePublishImpl::VertifyObjectReleaseValidity(const PublishReqPb &req, const SafeObjType &safeObj)
 {
     if (safeObj->IsSealed()) {

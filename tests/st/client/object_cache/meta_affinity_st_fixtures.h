@@ -43,7 +43,6 @@
 #include "datasystem/common/util/random_data.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/object_client.h"
-#include "datasystem/protos/hash_ring.pb.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/utils/service_discovery.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
@@ -65,6 +64,11 @@ public:
         opts.enableSpill = false;
         opts.enableDistributedMaster = "true";
         opts.workerGflagParams += " -enable_meta_affinity_replicate=true -enable_data_replication=false ";
+#ifdef USE_URMA
+        opts.workerGflagParams += " -arena_per_tenant=1 -enable_urma=true ";
+#else
+        opts.workerGflagParams += " -enable_urma=false ";
+#endif
 
         std::string hostIp = "127.0.0.1";
         for (size_t i = 0; i < opts.numWorkers; i++) {
@@ -101,7 +105,7 @@ public:
         DS_ASSERT_OK(cluster_->GetWorkerAddr(workerIndex, targetAddress));
 
         std::string ringValue;
-        DS_ASSERT_OK(db_->Get(ETCD_RING_PREFIX, "", ringValue));
+        DS_ASSERT_OK(db_->Get(GetTopologyTableName(), "", ringValue));
         object_cache::ReadOnlyHashRingView ringView;
         DS_ASSERT_OK(ringView.UpdateFromSerialized(ringValue, -1, nullptr));
 
@@ -130,6 +134,7 @@ public:
         ASSERT_EQ(setenv(envName.c_str(), envVal.c_str(), 1), 0);
         ServiceDiscoveryOptions sdOpts;
         sdOpts.etcdAddress = cluster_->GetEtcdAddrs();
+        sdOpts.clusterName = GetTestClusterName();
         sdOpts.hostIdEnvName = envName;
         sdOpts.affinityPolicy = ServiceAffinityPolicy::PREFERRED_SAME_NODE;
         auto serviceDiscovery = std::make_shared<ServiceDiscovery>(sdOpts);
@@ -167,12 +172,15 @@ public:
 
     void AssertLocationsContainBothWorkers(const std::vector<std::string> &locations)
     {
-        const std::string worker0Uuid = GetWorkerUuid(0, uuidMap_);
-        const std::string worker1Uuid = GetWorkerUuid(1, uuidMap_);
-        EXPECT_NE(std::find(locations.begin(), locations.end(), worker0Uuid), locations.end())
-            << "origin worker should keep a local copy location";
-        EXPECT_NE(std::find(locations.begin(), locations.end(), worker1Uuid), locations.end())
-            << "meta owner should hold primary location";
+        const auto containsWorker = [&](uint32_t workerIndex) {
+            const std::string &workerAddress =
+                workerIndex == 0 ? worker0Address_.ToString() : worker1Address_.ToString();
+            const std::string workerUuid = GetWorkerUuid(workerIndex, uuidMap_);
+            return std::find(locations.begin(), locations.end(), workerAddress) != locations.end()
+                   || std::find(locations.begin(), locations.end(), workerUuid) != locations.end();
+        };
+        EXPECT_TRUE(containsWorker(0)) << "origin worker should keep a local copy location";
+        EXPECT_TRUE(containsWorker(1)) << "meta owner should hold primary location";
     }
 
     bool IsPrimaryOnWorker(const std::string &objectKey, uint32_t workerIndex)

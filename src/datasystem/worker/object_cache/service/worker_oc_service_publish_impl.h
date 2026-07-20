@@ -27,7 +27,7 @@
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/protos/object_posix.pb.h"
 #include "datasystem/utils/status.h"
-#include "datasystem/worker/object_cache/async_send_manager.h"
+#include "datasystem/worker/object_cache/meta_affinity_replicate_manager.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_crud_common_api.h"
 
 namespace datasystem {

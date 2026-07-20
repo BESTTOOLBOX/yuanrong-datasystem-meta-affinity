@@ -35,10 +35,10 @@ target_link_libraries(common_ref PRIVATE ${COMMON_REF_DEPEND_LIBS})
 set(COMMON_READ_ONLY_HASH_RING_VIEW_SRCS read_only_hash_ring_view.cpp)
 
 set(COMMON_READ_ONLY_HASH_RING_VIEW_DEPEND_LIBS
+        ds_flags
         common_util
-        worker_hash_ring
-        hash_ring_protos)
+        cluster_topology_protos_client)
 
 add_library(common_read_only_hash_ring_view STATIC ${COMMON_READ_ONLY_HASH_RING_VIEW_SRCS})
 target_link_libraries(common_read_only_hash_ring_view PRIVATE ${COMMON_READ_ONLY_HASH_RING_VIEW_DEPEND_LIBS})
-add_dependencies(common_read_only_hash_ring_view hash_ring_protos worker_hash_ring)
+add_dependencies(common_read_only_hash_ring_view cluster_topology_protos_client)

@@ -60,7 +60,7 @@ bool IsJoinableWorkerState(int state)
 }
 
 const MembershipPb *FindWorkerPbAtAddress(const ClusterTopologyPb &ringInfo,
-                                          const std::map<std::string, HostPort> &workerUuid2AddrMap,
+                                          const std::map<std::string, HostPort> & /*workerUuid2AddrMap*/,
                                           const HostPort &workerAddress)
 {
     const auto exact = ringInfo.members().find(workerAddress.ToString());
