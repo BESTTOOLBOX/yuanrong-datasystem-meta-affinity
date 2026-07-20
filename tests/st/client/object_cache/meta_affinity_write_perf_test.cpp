@@ -159,9 +159,9 @@ double MeasureOneGet(const std::shared_ptr<ObjectClient> &client, const std::str
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - getStart).count();
 }
 
-void PutObject(MetaAffinityStFixture *fixture, const std::shared_ptr<ObjectClient> &client, const std::string &objectKey,
-               const std::string &payload, uint32_t metaOwnerWorkerIndex, bool waitForPrimaryColocation,
-               PutWritePerfSample *sampleOut)
+void PutObject(MetaAffinityStFixture *fixture, const std::shared_ptr<ObjectClient> &client,
+               const std::string &objectKey, const std::string &payload, uint32_t metaOwnerWorkerIndex,
+               bool waitForPrimaryColocation, PutWritePerfSample *sampleOut)
 {
     CreateParam param;
     const auto putStart = std::chrono::steady_clock::now();
@@ -295,8 +295,8 @@ void RunPutPerfScenario(MetaAffinityStFixture *fixture, const std::shared_ptr<Ob
         }
     }
 
-    PrintMetaAffinityWritePerfJson(scenario, payloadBytes, warmup, iters, SummarizeLatency(putSamples),
-                                   LatencyReport{}, SummarizeLatency(primaryReadySamples), immediateAtPutReturnCount);
+    PrintMetaAffinityWritePerfJson(scenario, payloadBytes, warmup, iters, SummarizeLatency(putSamples), LatencyReport{},
+                                   SummarizeLatency(primaryReadySamples), immediateAtPutReturnCount);
 
     if (MetaAffinityWritePerfAssertEnabled()) {
         if (scenario.find("direct_meta_owner") != std::string::npos) {
@@ -364,8 +364,7 @@ void RunImmediatePutGetPerfScenario(MetaAffinityStFixture *fixture, const std::s
                                    immediateAtPutReturnCount);
 
     if (MetaAffinityWritePerfAssertEnabled()) {
-        if (scenario.find("direct_meta_owner") != std::string::npos
-            && scenario.find("gateway") == std::string::npos) {
+        if (scenario.find("direct_meta_owner") != std::string::npos && scenario.find("gateway") == std::string::npos) {
             EXPECT_EQ(immediateAtPutReturnCount, samples.size()) << scenario;
         }
     }
@@ -453,10 +452,10 @@ void RunSameNodePutBenchmarks(MetaAffinityStFixture *fixture, size_t payloadByte
     fixture->InitTestClient(0, client);
     const std::string payload = RandomData().GetRandomString(static_cast<int64_t>(payloadBytes));
 
-    RunPutPerfScenario(fixture, client, 0, payload, payloadBytes, warmup, iters, "same_node_local_meta_colocated", false,
-                       false);
-    RunPutPerfScenario(fixture, client, 1, payload, payloadBytes, warmup, iters, "same_node_cross_worker_replicate", true,
-                       false);
+    RunPutPerfScenario(fixture, client, 0, payload, payloadBytes, warmup, iters, "same_node_local_meta_colocated",
+                       false, false);
+    RunPutPerfScenario(fixture, client, 1, payload, payloadBytes, warmup, iters, "same_node_cross_worker_replicate",
+                       true, false);
 }
 
 void RunSameNodeGetBenchmarks(MetaAffinityStFixture *fixture, size_t payloadBytes, size_t warmup, size_t iters)
@@ -475,24 +474,21 @@ void RunCrossNodePutBenchmarks(MetaAffinityStFixture *fixture, size_t payloadByt
                        "cross_node_remote_direct_meta_owner", false, true);
 
     std::shared_ptr<ObjectClient> gatewayClient;
-    fixture->InitRemoteOnlyAffinityClient(gatewayClient);
-    FLAGS_enable_meta_affinity_replicate = false;
+    fixture->InitTestClient(0, gatewayClient);
+    FLAGS_enable_meta_affinity_replicate = true;
     fixture->DelayMetaAffinityReplicateOnWorker0(100);
-    RunPutPerfScenario(fixture, gatewayClient, 1, payload, payloadBytes, warmup, iters,
-                       "cross_node_remote_gateway_replicate", true, false);
+    RunPutPerfScenario(fixture, gatewayClient, 1, payload, payloadBytes, warmup, iters, "cross_node_gateway_replicate",
+                       false, false);
     fixture->ClearMetaAffinityReplicateDelayOnWorker0();
     FLAGS_enable_meta_affinity_replicate = true;
 }
 
-void PrintMetaAffinityGetRpcReductionSummary(size_t payloadBytes, size_t warmup, size_t iters,
-                                             const LatencyReport &sameNodeColocatedImmediateGet,
-                                             const LatencyReport &sameNodeCrossWorkerColdGet,
-                                             const LatencyReport &sameNodeCrossWorkerImmediateGet,
-                                             const LatencyReport &crossNodeGatewayColdGet,
-                                             const LatencyReport &crossNodeDirectColdGet,
-                                             const LatencyReport &crossNodeRemoteImmediateGet,
-                                             const LatencyReport &crossNodeRemoteDirectColdGet,
-                                             const LatencyReport &crossNodeRemoteGatewayColdGet)
+void PrintMetaAffinityGetRpcReductionSummary(
+    size_t payloadBytes, size_t warmup, size_t iters, const LatencyReport &sameNodeColocatedImmediateGet,
+    const LatencyReport &sameNodeCrossWorkerColdGet, const LatencyReport &sameNodeCrossWorkerImmediateGet,
+    const LatencyReport &crossNodeGatewayColdGet, const LatencyReport &crossNodeDirectColdGet,
+    const LatencyReport &crossNodeRemoteImmediateGet, const LatencyReport &crossNodeRemoteDirectColdGet,
+    const LatencyReport &crossNodeRemoteGatewayColdGet)
 {
     const auto pct = [](double baselineUs, double improvedUs) {
         return baselineUs > 0 ? (baselineUs - improvedUs) / baselineUs * 100.0 : 0;
@@ -503,15 +499,17 @@ void PrintMetaAffinityGetRpcReductionSummary(size_t payloadBytes, size_t warmup,
        << ",\"same_node_colocated_immediate_get_avg_us\":" << sameNodeColocatedImmediateGet.avgUs
        << ",\"same_node_cross_worker_cold_get_avg_us\":" << sameNodeCrossWorkerColdGet.avgUs
        << ",\"same_node_cross_worker_immediate_get_avg_us\":" << sameNodeCrossWorkerImmediateGet.avgUs
-       << ",\"same_node_cold_get_improvement_pct\":" << pct(sameNodeCrossWorkerColdGet.avgUs, sameNodeColocatedImmediateGet.avgUs)
+       << ",\"same_node_cold_get_improvement_pct\":"
+       << pct(sameNodeCrossWorkerColdGet.avgUs, sameNodeColocatedImmediateGet.avgUs)
        << ",\"cross_node_gateway_cold_get_avg_us\":" << crossNodeGatewayColdGet.avgUs
        << ",\"cross_node_direct_cold_get_avg_us\":" << crossNodeDirectColdGet.avgUs
        << ",\"cross_node_remote_immediate_get_avg_us\":" << crossNodeRemoteImmediateGet.avgUs
        << ",\"cross_node_remote_direct_cold_get_avg_us\":" << crossNodeRemoteDirectColdGet.avgUs
        << ",\"cross_node_remote_gateway_cold_get_avg_us\":" << crossNodeRemoteGatewayColdGet.avgUs
-       << ",\"cross_node_cold_get_improvement_pct\":" << pct(crossNodeGatewayColdGet.avgUs, crossNodeDirectColdGet.avgUs)
-       << ",\"cross_node_remote_cold_get_improvement_pct\":" << pct(crossNodeRemoteGatewayColdGet.avgUs, crossNodeRemoteDirectColdGet.avgUs)
-       << "}";
+       << ",\"cross_node_cold_get_improvement_pct\":"
+       << pct(crossNodeGatewayColdGet.avgUs, crossNodeDirectColdGet.avgUs)
+       << ",\"cross_node_remote_cold_get_improvement_pct\":"
+       << pct(crossNodeRemoteGatewayColdGet.avgUs, crossNodeRemoteDirectColdGet.avgUs) << "}";
     std::cout << "META_AFFINITY_GET_RPC_REDUCTION_JSON=" << os.str() << std::endl;
 }
 
@@ -835,14 +833,14 @@ TEST_F(MetaAffinityWritePerfTest, GetRpcReductionSameNodeBenchmark)
                                       crossWorkerColdGet, crossWorkerImmediateGet);
 
     PrintMetaAffinityGetRpcReductionSummary(payloadBytes, warmup, iters, colocatedImmediateGet, crossWorkerColdGet,
-                                            crossWorkerImmediateGet, LatencyReport{}, LatencyReport{},
-                                            LatencyReport{}, LatencyReport{}, LatencyReport{});
+                                            crossWorkerImmediateGet, LatencyReport{}, LatencyReport{}, LatencyReport{},
+                                            LatencyReport{}, LatencyReport{});
 
     if (MetaAffinityWritePerfAssertEnabled()) {
-        const double sameNodeImprovePct = crossWorkerColdGet.avgUs > 0
-                                              ? (crossWorkerColdGet.avgUs - colocatedImmediateGet.avgUs)
-                                                    / crossWorkerColdGet.avgUs * 100.0
-                                              : 0;
+        const double sameNodeImprovePct =
+            crossWorkerColdGet.avgUs > 0
+                ? (crossWorkerColdGet.avgUs - colocatedImmediateGet.avgUs) / crossWorkerColdGet.avgUs * 100.0
+                : 0;
         EXPECT_GT(sameNodeImprovePct, 15.0)
             << "same-node colocated meta Put+Get should beat cross-worker cold Get RPC path";
         EXPECT_LT(colocatedImmediateGet.avgUs, crossWorkerColdGet.avgUs)
@@ -878,10 +876,8 @@ TEST_F(MetaAffinityWritePerfTest, GetRpcReductionCrossNodeBenchmark)
                                             remoteDirectColdGet, remoteGatewayColdGet);
 
     if (MetaAffinityWritePerfAssertEnabled()) {
-        const double crossNodeImprovePct = gatewayColdGet.avgUs > 0
-                                               ? (gatewayColdGet.avgUs - directColdGet.avgUs) / gatewayColdGet.avgUs
-                                                     * 100.0
-                                               : 0;
+        const double crossNodeImprovePct =
+            gatewayColdGet.avgUs > 0 ? (gatewayColdGet.avgUs - directColdGet.avgUs) / gatewayColdGet.avgUs * 100.0 : 0;
         EXPECT_GT(crossNodeImprovePct, 15.0)
             << "cross-node direct meta-owner write should reduce W0 reader Get RPC latency";
         EXPECT_LT(remoteImmediateGet.avgUs, gatewayColdGet.avgUs)
