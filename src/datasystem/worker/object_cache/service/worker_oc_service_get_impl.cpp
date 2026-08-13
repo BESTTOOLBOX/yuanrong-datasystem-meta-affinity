@@ -80,6 +80,7 @@ DS_DECLARE_string(cluster_name);
 DS_DECLARE_bool(oc_io_from_l2cache_need_metadata);
 DS_DECLARE_bool(authorization_enable);
 DS_DECLARE_bool(enable_data_replication);
+DS_DECLARE_bool(enable_query_meta_ub_merge);
 DS_DECLARE_uint32(data_migrate_rate_limit_mb);
 DS_DEFINE_bool(enable_l2_cache_fallback, true, "Control whether enable fallback to L2 cache when worker failed.");
 using namespace datasystem::worker;
@@ -902,7 +903,8 @@ Status WorkerOcServiceGetImpl::ProcessObjectsNotExistInLocal(const std::set<Read
     SLOW_LOG_IF_OR_VLOG(INFO, config.rpcSlowerThanUs > 0 && queryMetaUs >= config.rpcSlowerThanUs, 1,
                         FormatString("[Get] Master query done, targets: %d, hits: %d, cost: %.3fms",
                                      objectsNeedGetRemote.size(), queryMetas.size(), queryMetaMs));
-    auto getRet = GetObjectsFromAnywhere(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds);
+    auto getRet = GetObjectsFromAnywhere(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds,
+                                         queryMetaResult.ubBuffers);
     lastRc = getRet.IsError() ? getRet : lastRc;
     // If Get() is allowed to receive objects without meta, do it at last so that valid objects with meta can have
     // a fair change to complete within the given timeout.
@@ -1237,8 +1239,12 @@ Status WorkerOcServiceGetImpl::PrepareGetRequestHelper(const std::string &srcIpA
     return Status::OK();
 }
 
-Status WorkerOcServiceGetImpl::TryReconnectRemoteWorker(const std::string &endPoint, Status &lastResult)
+Status WorkerOcServiceGetImpl::TryReconnectRemoteWorker(const std::string &endPoint, Status &lastResult,
+                                                        std::string *remoteInstanceId)
 {
+    if (remoteInstanceId != nullptr) {
+        remoteInstanceId->clear();
+    }
     if (lastResult.IsOk() || lastResult.GetCode() != K_URMA_NEED_CONNECT) {
         return lastResult;
     }
@@ -1271,6 +1277,9 @@ Status WorkerOcServiceGetImpl::TryReconnectRemoteWorker(const std::string &endPo
 
     UrmaHandshakeRspPb dummyRsp;
     auto rc = constAccApi->second->ExecOnceParrallelExchange(dummyRsp);
+    if (rc.IsOk() && remoteInstanceId != nullptr && dummyRsp.has_hand_shake()) {
+        *remoteInstanceId = dummyRsp.hand_shake().urma_instance_id();
+    }
     auto elapsedMs = reconnectTimer.ElapsedMilliSecond();
     static const int logThresholdMs = 2'000;
     LOG_IF(INFO, elapsedMs > logThresholdMs)
@@ -1280,6 +1289,33 @@ Status WorkerOcServiceGetImpl::TryReconnectRemoteWorker(const std::string &endPo
         << GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() << ", status=" << rc.ToString();
     RETURN_IF_NOT_OK(rc);
     RETURN_STATUS(K_TRY_AGAIN, "Reconnect success");
+}
+
+Status WorkerOcServiceGetImpl::EnsureQueryMetaUrmaConnection(const std::string &endPoint)
+{
+    Status connectionStatus(K_URMA_NEED_CONNECT, "prepare QueryMeta UB connection");
+    std::string cachedInstanceId;
+    {
+        TbbTransportInstanceTable::const_accessor accessor;
+        if (queryMetaUrmaInstanceTable_.find(accessor, endPoint)) {
+            cachedInstanceId = accessor->second;
+        }
+    }
+    if (!cachedInstanceId.empty()) {
+        connectionStatus = CheckTransportConnectionStable(endPoint, cachedInstanceId);
+        if (connectionStatus.IsOk()) {
+            return connectionStatus;
+        }
+    }
+
+    std::string remoteInstanceId;
+    Status rc = TryReconnectRemoteWorker(endPoint, connectionStatus, &remoteInstanceId);
+    if ((rc.IsOk() || rc.GetCode() == K_TRY_AGAIN) && !remoteInstanceId.empty()) {
+        TbbTransportInstanceTable::accessor accessor;
+        (void)queryMetaUrmaInstanceTable_.insert(accessor, endPoint);
+        accessor->second = std::move(remoteInstanceId);
+    }
+    return rc;
 }
 
 Status WorkerOcServiceGetImpl::ConstructBatchGetRequest(const std::string &address, std::list<GetObjectInfo> &infos,
@@ -1621,14 +1657,142 @@ void WorkerOcServiceGetImpl::AttemptGetObjectsLocally(const std::shared_ptr<GetR
     }
 }
 
+std::shared_ptr<ShmOwner> WorkerOcServiceGetImpl::AcquireQueryMetaUbOwner(uint64_t requiredSize,
+                                                                         const std::string &tenantId)
+{
+    auto state = queryMetaUbPoolState_;
+    ShmOwner *owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        for (size_t i = state->idleOwners.size(); i > 0;) {
+            --i;
+            auto *candidate = state->idleOwners[i];
+            if (candidate->GetTenantId() != tenantId) {
+                continue;
+            }
+            state->idleOwners.erase(state->idleOwners.begin() + i);
+            if (candidate->size >= requiredSize) {
+                owner = candidate;
+                break;
+            }
+            delete candidate;
+        }
+    }
+    if (owner == nullptr) {
+        owner = new ShmOwner();
+    }
+    std::weak_ptr<QueryMetaUbPoolState> weakState(state);
+    return std::shared_ptr<ShmOwner>(owner, [weakState](ShmOwner *released) {
+        released->ResetDistribution();
+        if (released->GetPointer() == nullptr || released->size == 0) {
+            delete released;
+            return;
+        }
+        auto pool = weakState.lock();
+        if (pool == nullptr) {
+            delete released;
+            return;
+        }
+        std::lock_guard<std::mutex> lock(pool->mutex);
+        if (pool->idleOwners.size() < QUERY_META_UB_IDLE_BUFFER_LIMIT) {
+            pool->idleOwners.emplace_back(released);
+        } else {
+            delete released;
+        }
+    });
+}
+
+Status WorkerOcServiceGetImpl::InstallQueryMetaUbBuffer(const ObjectMetaPb &meta, QueryMetaUbBuffer &buffer,
+                                                        SafeObjType &entry)
+{
+    CHECK_FAIL_RETURN_STATUS(buffer.owner != nullptr, K_RUNTIME_ERROR,
+                             "QueryMeta UB data has no receive-buffer owner");
+    CHECK_FAIL_RETURN_STATUS(meta.data_size() <= buffer.dataCapacity, K_RUNTIME_ERROR,
+                             "QueryMeta UB data exceeds receive-buffer capacity");
+    const uint64_t metadataSize = GetMetadataSize();
+    CHECK_FAIL_RETURN_STATUS(meta.data_size() <= UINT64_MAX - metadataSize, K_RUNTIME_ERROR,
+                             "QueryMeta UB object size overflows");
+    auto shmUnit = std::make_shared<ShmUnit>();
+    RETURN_IF_NOT_OK(DistributeMemoryForObject(meta.object_key(), meta.data_size(), metadataSize, false, buffer.owner,
+                                               *shmUnit));
+    shmUnit->id = ShmKey::Intern(GetStringUuid());
+    entry->SetShmUnit(shmUnit);
+    buffer.owner.reset();
+    return Status::OK();
+}
+
 Status WorkerOcServiceGetImpl::QueryMetaDataFromMasterImpl(const HostPort &destMasterHostPort, uint64_t subTimeout,
                                                            const std::vector<std::string> &objKeysToQuery,
                                                            datasystem::master::QueryMetaRspPb &rsp,
-                                                           std::vector<RpcMessage> &payloads)
+                                                           std::vector<RpcMessage> &payloads,
+                                                           std::unordered_map<std::string, QueryMetaUbBuffer>
+                                                               &ubBuffers)
 {
     PerfPoint point(PerfKey::WORKER_QUERY_META_IMPL);
     datasystem::master::QueryMetaReqPb req;
     SetQueryMetaInfo(req, objKeysToQuery, destMasterHostPort.ToString(), true);
+#ifdef USE_URMA
+    // A receive buffer is sized to the configured maximum object size because
+    // the reader does not know the real size before QueryMeta returns. Keep
+    // multi-object Gets on the existing path to avoid reserving one maximum-size
+    // registered buffer per key.
+    if (IsUrmaEnabled() && objKeysToQuery.size() == 1) {
+        Status connectRc = EnsureQueryMetaUrmaConnection(destMasterHostPort.ToString());
+        if (connectRc.IsOk() || connectRc.GetCode() == K_TRY_AGAIN) {
+            uint64_t bufferSize = UrmaManager::Instance().GetUBMaxGetDataSize();
+            std::string transportInstanceId;
+            if (bufferSize > 0 && GetLocalTransportInstanceId(transportInstanceId).IsOk()) {
+                auto *ubReq =
+                    FLAGS_enable_query_meta_ub_merge ? req.mutable_ub_data_request() : nullptr;
+                if (ubReq != nullptr) {
+                    ubReq->set_buffer_size(bufferSize);
+                    ubReq->set_urma_instance_id(transportInstanceId);
+                }
+                bool prepared = true;
+                for (const auto &objectKey : objKeysToQuery) {
+                    QueryMetaUbBuffer buffer;
+                    const uint64_t metadataSize = GetMetadataSize();
+                    CHECK_FAIL_RETURN_STATUS(bufferSize <= UINT64_MAX - metadataSize, K_RUNTIME_ERROR,
+                                             "QueryMeta UB receive-buffer size overflows");
+                    auto backing = AcquireQueryMetaUbOwner(
+                        bufferSize + metadataSize, TenantAuthManager::ExtractTenantId(objectKey));
+                    Status rc = Status::OK();
+                    if (backing->GetPointer() == nullptr) {
+                        rc = AllocateMemoryForObject(objectKey, bufferSize, metadataSize, false, evictionManager_,
+                                                     *backing, CacheType::MEMORY, false);
+                    }
+                    if (rc.IsError() || backing->GetPointer() == nullptr
+                        || backing->size < bufferSize + metadataSize) {
+                        prepared = false;
+                        break;
+                    }
+                    GetObjectRemoteReqPb bufferReq;
+                    if (rc.IsOk() && ubReq != nullptr) {
+                        rc = FillRequestUrmaInfo(localAddress_, backing->GetPointer(), backing->GetOffset(),
+                                                metadataSize, bufferReq, backing->GetNumaId());
+                    }
+                    if (rc.IsError()) {
+                        prepared = false;
+                        break;
+                    }
+                    buffer.dataCapacity = bufferSize;
+                    buffer.remoteAddr = bufferReq.urma_info();
+                    buffer.owner = std::move(backing);
+                    if (ubReq != nullptr) {
+                        *ubReq->add_buffer_infos() = buffer.remoteAddr;
+                    }
+                    ubBuffers.emplace(objectKey, std::move(buffer));
+                }
+                if (!prepared) {
+                    req.clear_ub_data_request();
+                    ubBuffers.clear();
+                }
+            }
+        }
+    }
+#else
+    (void)ubBuffers;
+#endif
     std::shared_ptr<WorkerMasterOCApi> workerMasterApi =
         workerMasterApiManager_->GetWorkerMasterApi(destMasterHostPort);
     CHECK_FAIL_RETURN_STATUS(workerMasterApi != nullptr, K_RUNTIME_ERROR, "Get masterApi failed, cannot queryMeta");
@@ -1707,6 +1871,7 @@ Status WorkerOcServiceGetImpl::QueryMetadataFromMaster(const std::vector<std::st
     INJECT_POINT("worker.get_no_metadata", [&queryMetas, &result, &objectKeys, &absentObjectKeysWithVersion]() {
         queryMetas.clear();
         result.payloads.clear();
+        result.ubBuffers.clear();
         for (const auto &id : objectKeys) {
             (void)absentObjectKeysWithVersion.emplace(id, 0);
         }
@@ -1767,7 +1932,7 @@ Status WorkerOcServiceGetImpl::DispatchQueryMetadataGroups(
             RETURN_IF_NOT_OK(InitTimeoutsFromDispatch(remainingUs, dispatchTime));
             Timer queryMetaTimer;
             auto rc = QueryMetaDataFromMasterImpl(itemPtr->first, subTimeout, itemPtr->second, result.rsp,
-                                                  result.payloads);
+                                                  result.payloads, result.ubBuffers);
             if (rc.IsError()) {
                 LOG(ERROR) << FormatString("Query metadata from master[%s]: %s, elapsed %.3f ms",
                                            itemPtr->first.ToString(), rc.ToString(),
@@ -1803,6 +1968,25 @@ Status WorkerOcServiceGetImpl::MergeQueryMetadataResults(
             continue;
         }
         auto &rsp = batchResult.rsp;
+        for (auto &queryMeta : *rsp.mutable_query_metas()) {
+            const auto &meta = queryMeta.meta();
+            auto bufferIt = batchResult.ubBuffers.find(meta.object_key());
+            if (bufferIt == batchResult.ubBuffers.end()) {
+                continue;
+            }
+            if (meta.data_size() > bufferIt->second.dataCapacity || bufferIt->second.owner == nullptr) {
+                CHECK_FAIL_RETURN_STATUS(!queryMeta.data_transferred_by_ub(), K_RUNTIME_ERROR,
+                                         "QueryMeta UB response has an unusable receive buffer");
+                continue;
+            }
+            auto inserted = result.ubBuffers.emplace(meta.object_key(), std::move(bufferIt->second));
+            CHECK_FAIL_RETURN_STATUS(inserted.second, K_RUNTIME_ERROR,
+                                     "QueryMeta UB response contains a duplicate object key");
+            if (queryMeta.data_transferred_by_ub()) {
+                VLOG(1) << FormatString("[ObjectKey %s] QueryMeta and UB data completed without a payload copy",
+                                        meta.object_key());
+            }
+        }
         if (traceEnabled && rsp.latency_phase_us_size() > 0) {
             std::vector<uint32_t> phases(rsp.latency_phase_us().begin(), rsp.latency_phase_us().end());
             MergeDecodedPhasesToTrace(phases, rsp.latency_tick_dropped_count());
@@ -1944,15 +2128,17 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhere(std::vector<master::QueryM
                                                       std::vector<RpcMessage> &payloads,
                                                       std::map<ReadKey, LockedEntity> &lockedEntries,
                                                       std::unordered_set<std::string> &failedIds,
-                                                      std::set<ReadKey> &needRetryIds)
+                                                      std::set<ReadKey> &needRetryIds,
+                                                      std::unordered_map<std::string, QueryMetaUbBuffer> &ubBuffers)
 {
     PerfPoint totalPoint(PerfKey::WORKER_GET_OBJECTS_FROM_ANYWHERE);
-    if (FLAGS_enable_worker_worker_batch_get) {
+    if (FLAGS_enable_worker_worker_batch_get && ubBuffers.empty()) {
         PerfPoint stagePoint(PerfKey::WORKER_GET_OBJECTS_FROM_ANYWHERE_BATCH);
         return GetObjectsFromAnywhereBatched(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds);
     }
     PerfPoint stagePoint(PerfKey::WORKER_GET_OBJECTS_FROM_ANYWHERE_PARALLEL);
-    return GetObjectsFromAnywhereParallelly(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds);
+    return GetObjectsFromAnywhereParallelly(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds,
+                                            ubBuffers);
 }
 
 Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereParallelly(const std::vector<master::QueryMetaInfoPb> &queryMetas,
@@ -1960,11 +2146,14 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereParallelly(const std::vecto
                                                                 std::vector<RpcMessage> &payloads,
                                                                 std::map<ReadKey, LockedEntity> &lockedEntries,
                                                                 std::unordered_set<std::string> &failedIds,
-                                                                std::set<ReadKey> &needRetryIds)
+                                                                std::set<ReadKey> &needRetryIds,
+                                                                std::unordered_map<std::string, QueryMetaUbBuffer>
+                                                                    &ubBuffers)
 {
     const size_t kMinParallelRequests = 2;
     if (queryMetas.size() < kMinParallelRequests || !ShouldUseServiceThreadPoolFanout(FLAGS_use_brpc)) {
-        return GetObjectsFromAnywhereSerially(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds);
+        return GetObjectsFromAnywhereSerially(queryMetas, request, payloads, lockedEntries, failedIds, needRetryIds,
+                                              ubBuffers);
     }
     Status lastRc = Status::OK();
     std::vector<std::string> successIds;
@@ -1997,7 +2186,7 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereParallelly(const std::vecto
         auto dispatchTime = std::chrono::steady_clock::now();
         futures.emplace_back(remoteGetThreadPool_->Submit([=, &queryMetas, &lockedEntries, &commonMutex, &abortAllTasks,
                                                            &request, &payloads, &lastRc, &successIds, &needRetryIds,
-                                                           &failedIds]() {
+                                                           &failedIds, &ubBuffers]() {
             TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
             RETURN_IF_NOT_OK(InitTimeoutsFromDispatch(remainingUs, dispatchTime));
             if (abortAllTasks.load()) {
@@ -2017,8 +2206,11 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereParallelly(const std::vecto
             const auto &readKey = subIter->first;
             std::shared_ptr<SafeObjType> &subEntry = subIter->second.safeObj;
             bool isInsert = subIter->second.insert;
+            auto ubBufferIt = ubBuffers.find(objectKey);
+            QueryMetaUbBuffer *ubBuffer = ubBufferIt == ubBuffers.end() ? nullptr : &ubBufferIt->second;
             Timer getFromRemoteTimer;
-            Status status = GetObjectFromAnywhereWithLock(readKey, request, subEntry, isInsert, queryMeta, payloads);
+            Status status =
+                GetObjectFromAnywhereWithLock(readKey, request, subEntry, isInsert, queryMeta, payloads, ubBuffer);
             double remoteElapsed = getFromRemoteTimer.ElapsedMilliSecond();
 
             // Protects access to successIds, needRetryIds, failedIds, and lastRc
@@ -2066,7 +2258,9 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereSerially(const std::vector<
                                                               std::vector<RpcMessage> &payloads,
                                                               std::map<ReadKey, LockedEntity> &lockedEntries,
                                                               std::unordered_set<std::string> &failedIds,
-                                                              std::set<ReadKey> &needRetryIds)
+                                                              std::set<ReadKey> &needRetryIds,
+                                                              std::unordered_map<std::string, QueryMetaUbBuffer>
+                                                                  &ubBuffers)
 {
     Status lastRc;
     std::vector<std::string> successIds;
@@ -2090,9 +2284,11 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereSerially(const std::vector<
             continue;
         }
         const auto &readKey = iter->first;
+        auto ubBufferIt = ubBuffers.find(objectKey);
+        QueryMetaUbBuffer *ubBuffer = ubBufferIt == ubBuffers.end() ? nullptr : &ubBufferIt->second;
         Timer getFromRemoteTimer;
         auto status = GetObjectFromAnywhereWithLock(readKey, request, iter->second.safeObj, iter->second.insert,
-                                                    queryMeta, payloads);
+                                                    queryMeta, payloads, ubBuffer);
         double remoteElapsed = getFromRemoteTimer.ElapsedMilliSecond();
         if (status.IsOk()) {
             LOG(INFO) << FormatString("[ObjectKey %s] Get from remote success, elapsed %.3f ms.", objectKey,
@@ -2130,7 +2326,8 @@ Status WorkerOcServiceGetImpl::GetObjectFromAnywhereWithLock(const ReadKey &read
                                                              const std::shared_ptr<GetRequest> &request,
                                                              std::shared_ptr<SafeObjType> &entry, bool isInsert,
                                                              const master::QueryMetaInfoPb &queryMeta,
-                                                             std::vector<RpcMessage> &payloads)
+                                                             std::vector<RpcMessage> &payloads,
+                                                             QueryMetaUbBuffer *ubBuffer)
 {
     const auto &meta = queryMeta.meta();
     const auto &address = queryMeta.address();
@@ -2155,6 +2352,35 @@ Status WorkerOcServiceGetImpl::GetObjectFromAnywhereWithLock(const ReadKey &read
         // For RemoteH2D scenario, data never reaches shared memory, so need to re-do get entirely.
     }
     SetObjectEntryAccordingToMeta(meta, GetMetadataSize(), *entry);
+    if (ubBuffer != nullptr) {
+        Status status = InstallQueryMetaUbBuffer(meta, *ubBuffer, *entry);
+        if (status.IsError()) {
+            HandleGetFailureHelper(objectKey, meta.version(), entry, isInsert);
+            return status;
+        }
+    }
+    if (queryMeta.data_transferred_by_ub()) {
+        Status status = [&]() -> Status {
+            CHECK_FAIL_RETURN_STATUS(ubBuffer != nullptr, K_RUNTIME_ERROR,
+                                     "QueryMeta UB data has no receive buffer");
+
+            ReadObjectKV objectKV(readKey, *entry);
+            RETURN_IF_NOT_OK_PRINT_ERROR_MSG(objectKV.CheckReadOffset(), "Read offset verify failed");
+            evictionManager_->Add(objectKey);
+            if (FLAGS_enable_data_replication) {
+                RETURN_IF_NOT_OK(ProcessObjectEntryAndSyncMetadata(objectKV, false));
+            } else {
+                objectKV.GetObjEntry()->stateInfo.SetNeedToDelete(true);
+            }
+            CacheHitInfo::Instance().IncRemoteHit(1);
+            VLOG(1) << FormatString("[ObjectKey %s] Adopt QueryMeta UB receive buffer without copying", objectKey);
+            return UpdateRequestForSuccess(objectKV, request);
+        }();
+        if (status.IsError()) {
+            HandleGetFailureHelper(objectKey, meta.version(), entry, isInsert);
+        }
+        return status;
+    }
     // Assume the client work with only one device id.
     std::shared_ptr<std::string> commId = nullptr;
     if (IsRemoteH2DEnabled()) {

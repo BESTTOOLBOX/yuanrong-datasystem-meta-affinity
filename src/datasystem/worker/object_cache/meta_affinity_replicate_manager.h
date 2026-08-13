@@ -61,7 +61,11 @@ public:
     int GetInFlightCount() const;
 
 private:
-    static constexpr size_t kQueueNum = 4;
+    // Replication is deliberately serialized and starts only after a short
+    // foreground-idle window so Publish ACK latency does not compete with
+    // migration CPU, memory bandwidth, or RPC work.
+    static constexpr size_t kQueueNum = 1;
+    static constexpr std::chrono::milliseconds kForegroundQuietPeriod{ 10 };
     static constexpr std::chrono::milliseconds kStopDrainTimeout{ 30000 };
     static constexpr std::chrono::milliseconds kStopPollInterval{ 10 };
 
@@ -74,6 +78,7 @@ private:
     std::vector<Thread> threadPool_;
     std::atomic<bool> running_{ false };
     std::atomic<int> inFlight_{ 0 };
+    std::atomic<int64_t> lastEnqueueNs_{ 0 };
     std::function<void(MetaAffinityReplicateTask &&task)> replicateFunc_;
 };
 

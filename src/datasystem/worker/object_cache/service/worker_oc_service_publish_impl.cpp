@@ -96,7 +96,8 @@ void WorkerOcServicePublishImpl::StopMetaAffinityReplicate()
     }
 }
 
-void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV)
+void WorkerOcServicePublishImpl::PrepareMetaAffinityReplicateIfNeeded(
+    const ObjectKV &objectKV, std::unique_ptr<MetaAffinityReplicateTask> &replicateTask)
 {
     if (!FLAGS_enable_meta_affinity_replicate || metaAffinityReplicateManager_ == nullptr) {
         return;
@@ -111,8 +112,16 @@ void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicateIfNeeded(const Obj
         .version = safeObj->GetCreateTime(),
         .dataFormat = static_cast<uint32_t>(safeObj->stateInfo.GetDataFormat()),
     };
-    MetaAffinityReplicateTask task(std::move(param));
-    if (metaAffinityReplicateManager_->AddTask(std::move(task)).IsOk()) {
+    replicateTask = std::make_unique<MetaAffinityReplicateTask>(std::move(param));
+}
+
+void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicate(
+    std::unique_ptr<MetaAffinityReplicateTask> replicateTask)
+{
+    if (replicateTask == nullptr || metaAffinityReplicateManager_ == nullptr) {
+        return;
+    }
+    if (metaAffinityReplicateManager_->AddTask(std::move(*replicateTask)).IsOk()) {
         METRIC_INC(metrics::KvMetricId::WORKER_META_AFFINITY_REPLICATE_SCHEDULED_TOTAL);
     }
 }
@@ -331,8 +340,9 @@ Status WorkerOcServicePublishImpl::RollbackPublishFailure(ObjectKV &objectKV, Ob
     return Status::OK();
 }
 
-Status WorkerOcServicePublishImpl::PublishObject(ObjectKV &objectKV, const PublishParams &params,
-                                                 std::vector<RpcMessage> &payloads)
+Status WorkerOcServicePublishImpl::PublishObject(
+    ObjectKV &objectKV, const PublishParams &params, std::vector<RpcMessage> &payloads,
+    std::unique_ptr<MetaAffinityReplicateTask> &replicateTask)
 {
     const auto &objectKey = objectKV.GetObjKey();
     SafeObjType &safeObj = objectKV.GetObjEntry();
@@ -374,14 +384,15 @@ Status WorkerOcServicePublishImpl::PublishObject(ObjectKV &objectKV, const Publi
         VLOG(DEBUG_LOG_LEVEL) << FormatString("Finishing deleting the object %s from disk.", objectKey);
     }
     evictionManager_->Add(objectKey);
-    ScheduleMetaAffinityReplicateIfNeeded(objectKV);
+    PrepareMetaAffinityReplicateIfNeeded(objectKV, replicateTask);
     return Status::OK();
 }
 
 Status WorkerOcServicePublishImpl::PublishObjectWithLock(const std::string &objectKey, const PublishReqPb &req,
                                                          const ClientKey &clientId, const ShmKey &shmUnitId,
                                                          const std::vector<std::string> &nestedObjectKeys,
-                                                         std::vector<RpcMessage> &payloads, std::future<Status> &future)
+                                                         std::vector<RpcMessage> &payloads, std::future<Status> &future,
+                                                         std::unique_ptr<MetaAffinityReplicateTask> &replicateTask)
 {
     INJECT_POINT("worker.PublishObjectWithLock.begin");
     std::shared_ptr<SafeObjType> entry;
@@ -410,7 +421,7 @@ Status WorkerOcServicePublishImpl::PublishObjectWithLock(const std::string &obje
                                    .ttlSecond = req.ttl_second(),
                                    .existence = req.existence(),
                                    .cacheType = static_cast<CacheType>(req.cache_type()) };
-    auto rc = PublishObject(objectKV, params, payloads);
+    auto rc = PublishObject(objectKV, params, payloads, replicateTask);
     INJECT_POINT("publish.sleep");
     if (rc.IsError()) {
         if ((*entry)->GetShmUnit() == nullptr) {
@@ -443,7 +454,8 @@ Status WorkerOcServicePublishImpl::TryDeleteObjFromEvictionAndSpillFile(ObjectKV
 }
 
 Status WorkerOcServicePublishImpl::PublishImpl(const PublishReqPb &req, PublishRspPb &resp,
-                                               std::vector<RpcMessage> &payloads)
+                                               std::vector<RpcMessage> &payloads,
+                                               std::unique_ptr<MetaAffinityReplicateTask> &replicateTask)
 {
     // Step1: Add namespace for objectKeys.
     VLOG(1) << FormatString("[ObjectKey %s] is being publishing [Sz: %zu].", req.object_key(), req.data_size());
@@ -463,8 +475,10 @@ Status WorkerOcServicePublishImpl::PublishImpl(const PublishReqPb &req, PublishR
     auto shmUnitId = ShmKey::Intern(req.shm_id());
     auto clientId = ClientKey::Intern(req.client_id());
     Status rc =
-        RetryWhenDeadlock([this, &namespaceUri, &req, &clientId, &shmUnitId, &nestedObjectKeys, &payloads, &future] {
-            return PublishObjectWithLock(namespaceUri, req, clientId, shmUnitId, nestedObjectKeys, payloads, future);
+        RetryWhenDeadlock([this, &namespaceUri, &req, &clientId, &shmUnitId, &nestedObjectKeys, &payloads, &future,
+                           &replicateTask] {
+            return PublishObjectWithLock(namespaceUri, req, clientId, shmUnitId, nestedObjectKeys, payloads, future,
+                                         replicateTask);
         });
 
     // If worker diable shared-memory transfer but the request still carries shmUnitId, client-to-worker data transfer
@@ -518,7 +532,14 @@ Status WorkerOcServicePublishImpl::Publish(const PublishReqPb &req, PublishRspPb
         .TtlSecond(req.ttl_second())
         .Existence(req.existence())
         .CacheType(req.cache_type());
-    Status rc = PublishImpl(req, resp, payloads);
+    std::unique_ptr<MetaAffinityReplicateTask> replicateTask;
+    Status rc = PublishImpl(req, resp, payloads, replicateTask);
+    if (rc.IsOk()) {
+        // Enqueue only after all foreground PublishImpl work has completed.
+        // The manager then waits for its 10 ms quiet period before starting
+        // the serialized migration callback.
+        ScheduleMetaAffinityReplicate(std::move(replicateTask));
+    }
     if (traceEnabled) {
         Trace::Instance().AddLatencyTick(LatencyTickKey::WORKER_PUBLISH_END);
     }

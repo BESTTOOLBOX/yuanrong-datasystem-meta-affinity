@@ -102,6 +102,64 @@ TEST_F(MetaAffinityReplicateTest, ManagerExecutesQueuedTask)
     }
 }
 
+TEST_F(MetaAffinityReplicateTest, ManagerWaitsForForegroundQuietPeriod)
+{
+    MetaAffinityReplicateManager manager;
+    std::atomic<int64_t> callbackDelayMs{ -1 };
+    std::chrono::steady_clock::time_point enqueueStart;
+    DS_ASSERT_OK(manager.Init([&](MetaAffinityReplicateTask &&task) {
+        (void)task;
+        callbackDelayMs.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - enqueueStart)
+                .count(),
+            std::memory_order_release);
+    }));
+
+    MetaAffinityReplicateParam param{ .objectKey = "obj-delay", .version = 1, .dataFormat = 1 };
+    enqueueStart = std::chrono::steady_clock::now();
+    DS_ASSERT_OK(manager.AddTask(MetaAffinityReplicateTask(std::move(param))));
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (callbackDelayMs.load(std::memory_order_acquire) < 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_GE(callbackDelayMs.load(std::memory_order_acquire), 0);
+    EXPECT_GE(callbackDelayMs.load(std::memory_order_acquire), 10);
+}
+
+TEST_F(MetaAffinityReplicateTest, ManagerSerializesReplicationCallbacks)
+{
+    MetaAffinityReplicateManager manager;
+    std::atomic<int> activeCallbacks{ 0 };
+    std::atomic<int> maxActiveCallbacks{ 0 };
+    std::atomic<int> executedCount{ 0 };
+    DS_ASSERT_OK(manager.Init([&](MetaAffinityReplicateTask &&task) {
+        (void)task;
+        const int active = activeCallbacks.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int observed = maxActiveCallbacks.load(std::memory_order_acquire);
+        while (active > observed
+               && !maxActiveCallbacks.compare_exchange_weak(observed, active, std::memory_order_acq_rel)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        activeCallbacks.fetch_sub(1, std::memory_order_acq_rel);
+        executedCount.fetch_add(1, std::memory_order_release);
+    }));
+
+    for (int i = 0; i < 3; ++i) {
+        MetaAffinityReplicateParam param{
+            .objectKey = "obj-serial-" + std::to_string(i), .version = 1, .dataFormat = 1
+        };
+        DS_ASSERT_OK(manager.AddTask(MetaAffinityReplicateTask(std::move(param))));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (executedCount.load(std::memory_order_acquire) < 3 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(executedCount.load(std::memory_order_acquire), 3);
+    EXPECT_EQ(maxActiveCallbacks.load(std::memory_order_acquire), 1);
+}
+
 TEST_F(MetaAffinityReplicateTest, ManagerDrainsQueueOnStop)
 {
     MetaAffinityReplicateManager manager;

@@ -67,6 +67,15 @@ bool MetaAffinityReplicateManager::TryPopTask(int threadNum, MetaAffinityReplica
     if (queues_[threadNum].empty()) {
         return false;
     }
+    if (running_.load(std::memory_order_acquire)) {
+        const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        const auto quietNs = std::chrono::duration_cast<std::chrono::nanoseconds>(kForegroundQuietPeriod).count();
+        if (nowNs - lastEnqueueNs_.load(std::memory_order_acquire) < quietNs) {
+            return false;
+        }
+    }
     task = std::move(queues_[threadNum].front());
     queues_[threadNum].pop_front();
     return true;
@@ -123,6 +132,13 @@ Status MetaAffinityReplicateManager::AddTask(MetaAffinityReplicateTask &&task)
     const auto index = ObjectKey2QueueIndex(task.GetFirstObjectKey());
     {
         std::lock_guard<std::mutex> lock(*locks_[index]);
+        // Publish the quiet-period timestamp under the same lock that makes the
+        // task visible, so the executor cannot observe the task with a stale
+        // timestamp and start migration before the foreground grace period.
+        lastEnqueueNs_.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_release);
         queues_[index].emplace_back(std::move(task));
     }
     metrics::GetGauge(static_cast<uint16_t>(metrics::KvMetricId::WORKER_META_AFFINITY_REPLICATE_QUEUE_DEPTH))

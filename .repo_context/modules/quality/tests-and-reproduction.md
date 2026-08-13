@@ -5,7 +5,7 @@
 - Status:
   - `active`
 - Last verified against source:
-  - `2026-07-18`
+  - `2026-07-28`
 - Canonical source roots:
   - `tests`
   - `tests/README.md`
@@ -50,7 +50,7 @@
 | `tests/perf` | Performance helper binaries | `tests/perf/CMakeLists.txt` adds `zmq`; `tests/perf/zmq/CMakeLists.txt` builds ZMQ perf client/server/agent binaries. |
 | `tests/common` | Shared test support | `tests/common/CMakeLists.txt` adds `binmock`; `tests/common/binmock` provides function-stub/binmock support and has its own spec test. |
 | `tests/python` | Python unittest suites | `scripts/build_cmake.sh` runs `python3 -m unittest` from this directory after packaging and starting services. |
-| `tests/benchmark` | Python benchmark script area | Contains standalone benchmark scripts, not part of CTest registration. |
+| `tests/benchmark` | Standalone benchmark area | Contains scripts and independently built benchmark clients, not part of CTest registration. `meta_affinity_real_cluster` deploys one identical C++ client to every real-cluster client host and assigns writer/reader roles at runtime. |
 | `tests/kvconnector` | External connector patch/test material | Contains versioned patch/deploy/benchmark material, not part of the main CMake gtest tree. |
 
 - Verified current C++ source scale:
@@ -187,6 +187,26 @@ ctest -R test_suite.test_name
 cd tests/python
 python3 -m unittest
 ```
+
+- Build DataSystem with the real URMA backend (explicitly excluding URMA Mock), then build and run the manual
+  meta-affinity real-cluster benchmark:
+
+```bash
+tests/benchmark/meta_affinity_real_cluster/scripts/build_product_real_urma.sh -j 8
+tests/benchmark/meta_affinity_real_cluster/scripts/build_benchmark.sh
+python3 tests/benchmark/meta_affinity_real_cluster/cluster_runner.py preflight \
+  --config tests/benchmark/meta_affinity_real_cluster/cluster.json
+python3 tests/benchmark/meta_affinity_real_cluster/cluster_runner.py all \
+  --config tests/benchmark/meta_affinity_real_cluster/cluster.json
+```
+
+  This benchmark is intentionally outside CTest: every client host uses the same source revision and binary,
+  `--task` assigns writer or reader behavior at runtime, and the inventory provides the real worker topology. See
+  `tests/benchmark/meta_affinity_real_cluster/README.md` for prerequisites, B0/PR pairing, result collection, and
+  summarization. The strict five-reader comparison uses `paired_five.py validate`, then `run-b0` and `run-pr`;
+  it rejects different client/worker topology, workload parameters, key-set digests, or a baseline revision other
+  than the exact pre-PR1151 commit. Its paired RPC summary requires B0 QueryMeta plus GetObjectRemote and PR
+  QueryMeta with zero GetObjectRemote.
 
 ## Test Binaries Worth Knowing
 

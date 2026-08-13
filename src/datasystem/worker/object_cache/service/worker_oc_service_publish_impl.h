@@ -73,7 +73,8 @@ private:
      * @param[in] payloads The rpc request payload.
      * @return K_OK on success; the error code otherwise.
      */
-    Status PublishImpl(const PublishReqPb &req, PublishRspPb &resp, std::vector<RpcMessage> &payloads);
+    Status PublishImpl(const PublishReqPb &req, PublishRspPb &resp, std::vector<RpcMessage> &payloads,
+                       std::unique_ptr<MetaAffinityReplicateTask> &replicateTask);
 
     /**
      * @brief Reserve/get and lock a object from ObjectTable and publish/seal it.
@@ -84,11 +85,13 @@ private:
      * @param[in] nestedObjectKeys Objects that depend on objectKey.
      * @param[in] payloads The object data to be saved.
      * @param[out] future Async send future if write back to L2 cache, can't get during entry locked.
+     * @param[out] replicateTask Deferred meta-affinity replication task.
      * @return Status of the call.
      */
     Status PublishObjectWithLock(const std::string &objectKey, const PublishReqPb &req, const ClientKey &clientId,
                                  const ShmKey &shmUnitId, const std::vector<std::string> &nestedObjectKey,
-                                 std::vector<RpcMessage> &payloads, std::future<Status> &future);
+                                 std::vector<RpcMessage> &payloads, std::future<Status> &future,
+                                 std::unique_ptr<MetaAffinityReplicateTask> &replicateTask);
 
     /**
      * @brief Verify the validity of the object release.
@@ -181,9 +184,11 @@ private:
      * @param[in/out] objectKV The object to be sealed and its corresponding id.
      * @param[in] params Publish parameters.
      * @param[out] payloads Payloads for non-shared-memory cases.
+     * @param[out] replicateTask Deferred meta-affinity replication task.
      * @return Status of the call.
      */
-    Status PublishObject(ObjectKV &objectKV, const PublishParams &params, std::vector<RpcMessage> &payloads);
+    Status PublishObject(ObjectKV &objectKV, const PublishParams &params, std::vector<RpcMessage> &payloads,
+                         std::unique_ptr<MetaAffinityReplicateTask> &replicateTask);
 
     /**
      * @brief Try to delete Obj from Eviction list and spill file.
@@ -194,7 +199,9 @@ private:
     Status TryDeleteObjFromEvictionAndSpillFile(ObjectKV &objectKV, bool isInsert);
 
     void MetaAffinityReplicateFunc(MetaAffinityReplicateTask &&task);
-    void ScheduleMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV);
+    void PrepareMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV,
+                                              std::unique_ptr<MetaAffinityReplicateTask> &replicateTask);
+    void ScheduleMetaAffinityReplicate(std::unique_ptr<MetaAffinityReplicateTask> replicateTask);
 
     std::unique_ptr<MetaAffinityReplicateManager> metaAffinityReplicateManager_{ nullptr };
     std::shared_ptr<ThreadPool> memCpyThreadPool_{ nullptr };

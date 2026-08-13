@@ -1220,6 +1220,13 @@ Status OCMetadataManager::GetObjectMetaType(const std::string &objectKey, Object
 
 Status OCMetadataManager::QueryMeta(const QueryMetaReqPb &req, QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads)
 {
+    if (req.has_ub_data_request()) {
+        const auto &ubReq = req.ub_data_request();
+        CHECK_FAIL_RETURN_STATUS(ubReq.buffer_size() > 0 && !ubReq.urma_instance_id().empty(), K_INVALID,
+                                 "QueryMeta UB buffer is invalid");
+        CHECK_FAIL_RETURN_STATUS(ubReq.buffer_infos_size() == req.ids_size(), K_INVALID,
+                                 "QueryMeta UB buffer count does not match object key count");
+    }
     PerfPoint point(PerfKey::MASTER_QUERY_META_FILL_REDIRECT);
     std::vector<std::string> notRedirectObjectKeys = { req.ids().begin(), req.ids().end() };
     const auto &address = req.address();
@@ -1256,9 +1263,19 @@ Status OCMetadataManager::QueryMetaFromMetaTable(const QueryMetaReqPb &req, cons
     uint64_t payloadSize = 0;
     std::vector<QueryMetaInfoPb> infos;
     infos.reserve(objectKeys.size());
-    auto func = [this, &address, &payloadSize, &payloads, &req](const std::string &objectKey,
-                                                                std::vector<QueryMetaInfoPb> &infos,
-                                                                std::vector<std::string> &notExistObjectKeys) {
+    std::unordered_map<std::string, size_t> ubBufferIndexes;
+    if (req.has_ub_data_request()) {
+        ubBufferIndexes.reserve(req.ids_size());
+        for (int i = 0; i < req.ids_size(); ++i) {
+            auto inserted = ubBufferIndexes.emplace(req.ids(i), static_cast<size_t>(i));
+            CHECK_FAIL_RETURN_STATUS(inserted.second, K_INVALID,
+                                     FormatString("QueryMeta UB request contains duplicate object key: %s",
+                                                  req.ids(i)));
+        }
+    }
+    auto func = [this, &address, &payloadSize, &payloads, &req](
+                    const std::string &objectKey, size_t requestIndex, std::vector<QueryMetaInfoPb> &infos,
+                    std::vector<std::string> &notExistObjectKeys) {
         auto getMetaInfo = [&](auto &accessor, QueryMetaInfoPb &info) {
             info.mutable_meta()->CopyFrom(accessor->second.meta);
             info.mutable_meta()->set_object_key(objectKey);
@@ -1268,18 +1285,31 @@ Status OCMetadataManager::QueryMetaFromMetaTable(const QueryMetaReqPb &req, cons
             info.set_single_copy(accessor->second.IsPrimaryWithoutCopy(accessor->second.meta.primary_address()));
         };
         QueryMetaInfoPb info;
+        QueryAndGetMetaSnapshot dataMeta;
+        bool tryGetData = false;
+        auto snapshotDataMeta = [this, &dataMeta](const auto &accessor) {
+            dataMeta.dataSize = accessor->second.meta.data_size();
+            dataMeta.version = accessor->second.meta.version();
+            auto location = accessor->second.locations.find(masterAddress_);
+            dataMeta.localCopyAvailable =
+                location != accessor->second.locations.end() && location->second == AckState::ACK;
+        };
         if (!FLAGS_enable_data_replication) {
-            TbbMetaTable::const_accessor accessor;
             size_t shardIdx = GetShardIndex(objectKey);
-            if (metaShards_[shardIdx].table.find(accessor, objectKey) && accessor->second.multiSetState != PENDING) {
+            TbbMetaTable::const_accessor accessor;
+            if (metaShards_[shardIdx].table.find(accessor, objectKey)
+                && accessor->second.multiSetState != PENDING) {
                 getMetaInfo(accessor, info);
+                snapshotDataMeta(accessor);
+                tryGetData = true;
             }
         } else {
             TbbMetaTable::accessor accessor;
             size_t shardIdx = GetShardIndex(objectKey);
             if (metaShards_[shardIdx].table.find(accessor, objectKey) && accessor->second.multiSetState != PENDING) {
                 getMetaInfo(accessor, info);
-                TryGetObjectData(objectKey, accessor, payloadSize, info, payloads);
+                snapshotDataMeta(accessor);
+                tryGetData = true;
                 // If we enable data replication, we only set the not exist location as UNACK state because of the
                 // following reason:
                 // 1. If the location exists and its status is ACK, this issue likely stems from concurrent query
@@ -1294,6 +1324,9 @@ Status OCMetadataManager::QueryMetaFromMetaTable(const QueryMetaReqPb &req, cons
                 }
             }
         }
+        if (tryGetData) {
+            TryGetObjectData(req, requestIndex, objectKey, dataMeta, payloadSize, info, payloads);
+        }
         if (!info.meta().object_key().empty()) {
             infos.emplace_back(std::move(info));
             return Status::OK();
@@ -1305,9 +1338,18 @@ Status OCMetadataManager::QueryMetaFromMetaTable(const QueryMetaReqPb &req, cons
     const size_t parallelLimit = 128;
     const size_t objectKeyCount = objectKeys.size();
     // Use serial lookup when URMA is disabled, the batch is small, or brpc mode must avoid ParallelFor sem_wait.
-    if (!IsUrmaEnabled() || !Parallel::ShouldUseServiceParallelFor(objectKeyCount, parallelLimit, FLAGS_use_brpc)) {
-        for (const auto &objectKey : objectKeys) {
-            func(objectKey, infos, notExistObjectKeys);
+    if (req.has_ub_data_request() || !IsUrmaEnabled()
+        || !Parallel::ShouldUseServiceParallelFor(objectKeyCount, parallelLimit, FLAGS_use_brpc)) {
+        for (size_t i = 0; i < objectKeys.size(); ++i) {
+            size_t requestIndex = i;
+            if (req.has_ub_data_request()) {
+                auto index = ubBufferIndexes.find(objectKeys[i]);
+                CHECK_FAIL_RETURN_STATUS(index != ubBufferIndexes.end(), K_INVALID,
+                                         FormatString("QueryMeta UB request has no buffer for object key: %s",
+                                                      objectKeys[i]));
+                requestIndex = index->second;
+            }
+            RETURN_IF_NOT_OK(func(objectKeys[i], requestIndex, infos, notExistObjectKeys));
         }
     } else {
         // protect infos/notExistObjectKeys/lastRc
@@ -1319,7 +1361,7 @@ Status OCMetadataManager::QueryMetaFromMetaTable(const QueryMetaReqPb &req, cons
             Status rc;
             for (size_t i = start; i < end; i++) {
                 const auto &objectKey = objectKeys[i];
-                rc = func(objectKey, batchInfos, batchNotExists);
+                rc = func(objectKey, i, batchInfos, batchNotExists);
                 if (rc.IsError()) {
                     break;
                 }
@@ -4528,28 +4570,63 @@ Status OCMetadataManager::ReadLocalQueryAndGetData(const QueryAndGetReqPb &req, 
     return localApi_->GetObjectRemoteForQueryAndGet(localReq, payloads);
 }
 
-void OCMetadataManager::TryGetObjectData(const std::string &objectKey, const TbbMetaTable::accessor &accessor,
+void OCMetadataManager::TryGetObjectData(const QueryMetaReqPb &queryReq, size_t requestIndex,
+                                         const std::string &objectKey, const QueryAndGetMetaSnapshot &meta,
                                          uint64_t &payloadSize, QueryMetaInfoPb &queryMeta,
                                          std::vector<RpcMessage> &payloads)
 {
-    // don't try to query data if enable UB.
-    if (IsUrmaEnabled()) {
+    INJECT_POINT("ocMetaManager.noNeedGetFromLocal", []() { return; });
+    // Preserve the original URMA QueryMeta behavior for peers that do not
+    // explicitly advertise a receive buffer. Only the new request can merge
+    // the metadata response with an UB data write.
+    const bool hasUbRequest = queryReq.has_ub_data_request();
+    const bool urmaEnabled = IsUrmaEnabled();
+    if ((urmaEnabled && !hasUbRequest) || (!urmaEnabled && hasUbRequest)) {
         return;
     }
-    INJECT_POINT("ocMetaManager.noNeedGetFromLocal", []() { return; });
     if (localApi_ == nullptr) {
         return;
     }
-    uint64_t dataSize = accessor->second.meta.data_size();
-    if (payloadSize > QUERY_AND_GET_MAX_PAYLOAD_SIZE || dataSize > QUERY_AND_GET_MAX_PAYLOAD_SIZE - payloadSize) {
+    uint64_t dataSize = meta.dataSize;
+    if (!hasUbRequest
+        && (payloadSize > QUERY_AND_GET_MAX_PAYLOAD_SIZE
+            || dataSize > QUERY_AND_GET_MAX_PAYLOAD_SIZE - payloadSize)) {
         return;
     }
-    auto iter = accessor->second.locations.find(masterAddress_);
-    if (iter == accessor->second.locations.end() || iter->second != AckState::ACK) {
+    if (!meta.localCopyAvailable) {
         return;
     }
     if (notifyWorkerManager_->CheckExistAsyncWorkerOp(
             masterAddress_, objectKey, NotifyWorkerOpType::CACHE_INVALID | NotifyWorkerOpType::PRIMARY_COPY_INVALID)) {
+        return;
+    }
+    if (hasUbRequest) {
+        const auto &ubReq = queryReq.ub_data_request();
+        if (requestIndex >= static_cast<size_t>(ubReq.buffer_infos_size()) || dataSize > ubReq.buffer_size()) {
+            return;
+        }
+        GetObjectRemoteReqPb localReq;
+        localReq.set_try_lock(true);
+        localReq.set_object_key(objectKey);
+        localReq.set_version(meta.version);
+        localReq.set_read_offset(0);
+        localReq.set_read_size(dataSize);
+        localReq.set_data_size(dataSize);
+        *localReq.mutable_urma_info() = ubReq.buffer_infos(static_cast<int>(requestIndex));
+        localReq.set_urma_instance_id(ubReq.urma_instance_id());
+        Status status = akSkManager_->GenerateSignature(localReq);
+        if (status.IsError()) {
+            LOG(WARNING) << FormatString("[ObjectKey %s] Failed to sign QueryMeta UB data request: %s", objectKey,
+                                         status);
+            return;
+        }
+        std::vector<RpcMessage> ignoredPayloads;
+        status = localApi_->GetObjectRemoteForQueryAndGet(localReq, ignoredPayloads);
+        if (status.IsOk()) {
+            queryMeta.set_data_transferred_by_ub(true);
+        } else {
+            VLOG(1) << FormatString("[ObjectKey %s] QueryMeta UB data miss: %s", objectKey, status.ToString());
+        }
         return;
     }
     GetObjectRemoteReqPb req;
@@ -4559,7 +4636,7 @@ void OCMetadataManager::TryGetObjectData(const std::string &objectKey, const Tbb
     // it's Ok and we will tell the worker we can not get the object data directly.
     req.set_try_lock(true);
     req.set_object_key(objectKey);
-    req.set_version(accessor->second.meta.version());
+    req.set_version(meta.version);
     Status status = akSkManager_->GenerateSignature(req);
     if (status.IsError()) {
         LOG(WARNING) << FormatString("[ObjectKey %s] Failed to generate signature, detail: %s", objectKey, status);
@@ -4571,7 +4648,12 @@ void OCMetadataManager::TryGetObjectData(const std::string &objectKey, const Tbb
         // If we meets K_UNKNOWN_ERROR, it means worker want us to erase the location because the object is bad.
         if (status.GetCode() == StatusCode::K_UNKNOWN_ERROR) {
             INJECT_POINT("master.query_meta.get_object_remote", []() { return; });
-            (void)accessor->second.locations.erase(masterAddress_);
+            TbbMetaTable::accessor accessor;
+            size_t shardIdx = GetShardIndex(objectKey);
+            if (metaShards_[shardIdx].table.find(accessor, objectKey) && meta.version >= 0
+                && accessor->second.meta.version() == static_cast<uint64_t>(meta.version)) {
+                (void)accessor->second.locations.erase(masterAddress_);
+            }
         }
         LOG(WARNING) << FormatString("[ObjectKey %s] Failed to get data directly, detail: %s", objectKey, status);
         return;

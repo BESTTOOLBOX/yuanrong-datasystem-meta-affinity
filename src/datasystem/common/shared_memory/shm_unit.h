@@ -135,6 +135,14 @@ public:
      */
     Status DistributeMemory(uint64_t shmSize, ShmUnit &shmUnit);
 
+    /**
+     * @brief Reset the distribution cursor after all distributed ShmUnit instances have been released.
+     *
+     * The caller must have exclusive ownership of this ShmOwner. This is used by receive-buffer pools that recycle
+     * an aggregate allocation only after the last distributed view is destroyed.
+     */
+    void ResetDistribution();
+
 private:
     /**
      * @brief Move up the cursor in ShmOwner to indicate some memory is distributed.

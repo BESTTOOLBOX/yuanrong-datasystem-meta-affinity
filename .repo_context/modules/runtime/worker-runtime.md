@@ -37,6 +37,15 @@
     routed requests with `is_routed=true` call `worker::AuthenticateRequest` using the signed request tenant, while
     legacy gateway requests retain the registered-client authentication path. Deploy workers with this routed-request
     branch before enabling routed Set or MSet in newer clients during rolling upgrades.
+  - for a one-key cold Get through a same-node worker with URMA enabled, the reader worker can attach a registered UB
+    receive buffer to `QueryMeta`. When the Meta Owner has an acknowledged local copy, its local worker writes the data
+    into that buffer before `QueryMeta` returns, so the cross-node `GetObjectRemote` round trip is removed. Transport
+    setup failure, a missing local copy, metadata movement, and older peers preserve the existing QueryMeta-then-Get
+    fallback. This path is bounded by the configured UB maximum Get size rather than the legacy 512 KiB inline-payload
+    cap; multi-key Gets retain the existing batch path.
+  - meta-affinity replication records the immutable task parameters while the object entry is locked, but enqueues the
+    task only after foreground `PublishImpl` work completes. A single background queue waits for a 10 ms
+    foreground-quiet window and runs migrations serially; shutdown skips the quiet delay while draining queued work.
   - global-reference decrease treats a missing worker-to-master API after a successful owner lookup as
     `K_RPC_UNAVAILABLE`; affected ids enter the existing RPC-failure path instead of being silently skipped during a
     connection rebuild window.

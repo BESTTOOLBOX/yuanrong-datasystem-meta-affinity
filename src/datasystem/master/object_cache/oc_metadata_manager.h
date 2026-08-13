@@ -1863,14 +1863,17 @@ private:
 
     /**
      * @brief Try get the object data directly.
+     * @param[in] queryReq QueryMeta request and optional UB receive-buffer information.
+     * @param[in] requestIndex Original request index used to select the matching UB buffer.
      * @param[in] objectKey Object key.
-     * @param[in] accessor Metatable TBB lock.
+     * @param[in] meta Metadata snapshot captured while holding the metadata-table lock.
      * @param[in out] payloadSize Payload size get directly.
      * @param[out] queryMeta QueryMeta response, if we get data success, the payload index would be saved here.
      * @param[out] payloads If we get data success, the data would be saved here.
      */
-    void TryGetObjectData(const std::string &objectKey, const TbbMetaTable::accessor &accessor, uint64_t &payloadSize,
-                          QueryMetaInfoPb &queryMeta, std::vector<RpcMessage> &payloads);
+    void TryGetObjectData(const QueryMetaReqPb &queryReq, size_t requestIndex, const std::string &objectKey,
+                          const QueryAndGetMetaSnapshot &meta, uint64_t &payloadSize, QueryMetaInfoPb &queryMeta,
+                          std::vector<RpcMessage> &payloads);
 
     /**
      * @brief Validate the optional QueryAndGet inline-data request.

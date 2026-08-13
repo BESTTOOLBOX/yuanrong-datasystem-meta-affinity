@@ -199,17 +199,38 @@ public:
 private:
     using ObjectKeysQueryMetaFailed = std::tuple<std::unordered_set<std::string>, std::unordered_set<std::string>>;
     using TbbTransportStubTable = tbb::concurrent_hash_map<std::string, std::shared_ptr<WorkerRemoteWorkerTransApi>>;
+    using TbbTransportInstanceTable = tbb::concurrent_hash_map<std::string, std::string>;
+
+    struct QueryMetaUbBuffer {
+        uint64_t dataCapacity = 0;
+        UrmaRemoteAddrPb remoteAddr;
+        std::shared_ptr<ShmOwner> owner;
+    };
+
+    struct QueryMetaUbPoolState {
+        ~QueryMetaUbPoolState()
+        {
+            for (auto *owner : idleOwners) {
+                delete owner;
+            }
+        }
+
+        std::mutex mutex;
+        std::vector<ShmOwner *> idleOwners;
+    };
 
     struct QueryMetadataFromMasterResult {
         std::vector<master::QueryMetaInfoPb> queryMetas;
         std::vector<RpcMessage> payloads;
         std::map<std::string, uint64_t> absentObjectKeysWithVersion;
+        std::unordered_map<std::string, QueryMetaUbBuffer> ubBuffers;
     };
 
     struct BatchQueryMetaResult {
         datasystem::master::QueryMetaRspPb rsp;
         std::unordered_set<std::string> failedKeys;
         std::vector<RpcMessage> payloads;
+        std::unordered_map<std::string, QueryMetaUbBuffer> ubBuffers;
     };
 
     struct LockedEntity {
@@ -611,7 +632,8 @@ private:
     Status GetObjectsFromAnywhere(std::vector<master::QueryMetaInfoPb> &queryMetas,
                                   const std::shared_ptr<GetRequest> &request, std::vector<RpcMessage> &payloads,
                                   std::map<ReadKey, LockedEntity> &lockedEntries,
-                                  std::unordered_set<std::string> &failedIds, std::set<ReadKey> &needRetryIds);
+                                  std::unordered_set<std::string> &failedIds, std::set<ReadKey> &needRetryIds,
+                                  std::unordered_map<std::string, QueryMetaUbBuffer> &ubBuffers);
 
     /**
      * @brief Get objects from anywhere parallelly.
@@ -629,7 +651,8 @@ private:
                                             std::vector<RpcMessage> &payloads,
                                             std::map<ReadKey, LockedEntity> &lockedEntries,
                                             std::unordered_set<std::string> &failedIds,
-                                            std::set<ReadKey> &needRetryIds);
+                                            std::set<ReadKey> &needRetryIds,
+                                            std::unordered_map<std::string, QueryMetaUbBuffer> &ubBuffers);
 
     /**
      * @brief Get objects from anywhere serially.
@@ -645,7 +668,8 @@ private:
     Status GetObjectsFromAnywhereSerially(const std::vector<master::QueryMetaInfoPb> &queryMetas,
                                           const std::shared_ptr<GetRequest> &request, std::vector<RpcMessage> &payloads,
                                           std::map<ReadKey, LockedEntity> &lockedEntries,
-                                          std::unordered_set<std::string> &failedIds, std::set<ReadKey> &needRetryIds);
+                                          std::unordered_set<std::string> &failedIds, std::set<ReadKey> &needRetryIds,
+                                          std::unordered_map<std::string, QueryMetaUbBuffer> &ubBuffers);
 
     /**
      * @brief Get objects from anywhere batched.
@@ -675,7 +699,8 @@ private:
      */
     Status GetObjectFromAnywhereWithLock(const ReadKey &readKey, const std::shared_ptr<GetRequest> &request,
                                          std::shared_ptr<SafeObjType> &entry, bool isInsert,
-                                         const master::QueryMetaInfoPb &queryMeta, std::vector<RpcMessage> &payloads);
+                                         const master::QueryMetaInfoPb &queryMeta, std::vector<RpcMessage> &payloads,
+                                         QueryMetaUbBuffer *ubBuffer = nullptr);
 
     /**
      * @brief Preprocess the list of objectKeys before getting them from L2 cache without meta.
@@ -984,11 +1009,37 @@ private:
      * @param[in] objKeysToQuery The objects to query.
      * @param[out] rsp The qurey meta response.
      * @param[out] payloads The payloads that contains object data.
+     * @param[out] ubBuffers Registered receive buffers for objects transferred as part of QueryMeta.
      * @return Status of the call.
      */
     Status QueryMetaDataFromMasterImpl(const HostPort &destMasterHostPort, uint64_t subTimeout,
                                        const std::vector<std::string> &objKeysToQuery,
-                                       datasystem::master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads);
+                                       datasystem::master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads,
+                                       std::unordered_map<std::string, QueryMetaUbBuffer> &ubBuffers);
+
+    /**
+     * @brief Acquire a tenant-matching registered receive-buffer owner.
+     * @param[in] requiredSize Minimum allocation size.
+     * @param[in] tenantId Tenant that owns the allocation.
+     * @return A pooled or newly created owner.
+     */
+    std::shared_ptr<ShmOwner> AcquireQueryMetaUbOwner(uint64_t requiredSize, const std::string &tenantId);
+
+    /**
+     * @brief Install a pooled QueryMeta UB receive buffer as the object's shared-memory unit.
+     * @param[in] meta Object metadata returned by QueryMeta.
+     * @param[in,out] buffer Pooled receive buffer whose owner is moved into the object entry.
+     * @param[in,out] entry Locked object entry.
+     * @return Status of the operation.
+     */
+    Status InstallQueryMetaUbBuffer(const ObjectMetaPb &meta, QueryMetaUbBuffer &buffer, SafeObjType &entry);
+
+    /**
+     * @brief Ensure the local worker has a stable URMA connection to a Meta Owner worker.
+     * @param[in] endPoint Meta Owner worker endpoint.
+     * @return K_OK for an existing connection, K_TRY_AGAIN after a successful new handshake, or an error.
+     */
+    Status EnsureQueryMetaUrmaConnection(const std::string &endPoint);
 
     /**
      * @brief Process the object keys that fail to query metadata If meta is stored in etcd.
@@ -1026,9 +1077,11 @@ private:
      * @brief Try reconnect with remote worker by fast transport.
      * @param[in] endPoint Transport endpoint.
      * @param[in] lastResult Determine whether it is necessary to perform reconnection by checking this status.
+     * @param[out] remoteInstanceId Remote transport instance id returned by a successful handshake.
      * @return True if can tolerance does not exist node.
      */
-    Status TryReconnectRemoteWorker(const std::string &endPoint, Status &lastResult);
+    Status TryReconnectRemoteWorker(const std::string &endPoint, Status &lastResult,
+                                    std::string *remoteInstanceId = nullptr);
 
     Status ProcessRemoteGetInNotification(const NotifyRemoteGetReqPb &req, std::set<ReadKey> objectsNeedGetRemote,
                                           QueryMetaMap &queryMetas, NotifyRemoteGetRspPb &rsp, uint64_t &migratedBytes);
@@ -1078,6 +1131,17 @@ private:
     static constexpr size_t OBJECTS_PUZZLED_IDX = 1;
 
     TbbTransportStubTable tarnsportApiTable_;
+
+    // Cache the remote instance id so QueryMeta can validate an existing URMA
+    // connection locally instead of performing a transport handshake for every
+    // cold read.
+    TbbTransportInstanceTable queryMetaUrmaInstanceTable_;
+
+    // Keep enough registered receive buffers for the normal concurrent QueryMeta
+    // fan-out. A limit below the reader concurrency causes a large allocation on
+    // every batch even after warm-up.
+    static constexpr size_t QUERY_META_UB_IDLE_BUFFER_LIMIT = 8;
+    std::shared_ptr<QueryMetaUbPoolState> queryMetaUbPoolState_ = std::make_shared<QueryMetaUbPoolState>();
 };
 
 }  // namespace object_cache

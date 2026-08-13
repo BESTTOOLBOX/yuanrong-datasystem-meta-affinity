@@ -152,6 +152,11 @@ Status ShmOwner::DistributeMemory(uint64_t shmSize, ShmUnit &shmUnit)
     return Status::OK();
 }
 
+void ShmOwner::ResetDistribution()
+{
+    cursor_.store(0, std::memory_order_release);
+}
+
 uint64_t ShmOwner::AllocatePosition(uint64_t shmSize)
 {
     return cursor_.fetch_add(Align4BitsCeiling(shmSize), std::memory_order_acq_rel);

@@ -9,6 +9,11 @@
 
 </div>
 
+> [!IMPORTANT]
+> This private development mirror contains the latest **Meta-Affinity Write + QueryMeta/Data Merge** work based on
+> PR1151. Start with [META_AFFINITY_README_CN.md](META_AFFINITY_README_CN.md) for the change list, target scenarios,
+> build and experiment workflow, feature flags, and current TCP/UB benchmark results.
+
 openYuanrong 是一个 Serverless 分布式计算引擎，致力于以一套统一 Serverless 架构支持 AI、大数据、微服务等各类分布式应用。它提供多语言函数编程接口，以单机编程体验简化分布式应用开发；提供分布式动态调度和数据共享等能力，实现分布式应用的高性能运行和集群的高效资源利用。
 
 ## 简介

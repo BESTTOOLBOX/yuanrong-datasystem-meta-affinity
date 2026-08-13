@@ -246,8 +246,9 @@ Status WorkerOcServiceGetImpl::GetObjectsFromAnywhereBatched(std::vector<master:
 
     point.RecordAndReset(PerfKey::WORKER_GET_BATCH_HANDLE_DATA_IN_META);
     // For the ones that already got their payload from queried meta, fallback to existing logic.
-    lastRc =
-        GetObjectsFromAnywhereSerially(payloadIndexMetas, request, payloads, lockedEntries, failedIds, needRetryIds);
+    std::unordered_map<std::string, QueryMetaUbBuffer> noUbBuffers;
+    lastRc = GetObjectsFromAnywhereSerially(payloadIndexMetas, request, payloads, lockedEntries, failedIds,
+                                            needRetryIds, noUbBuffers);
     point.RecordAndReset(PerfKey::WORKER_GET_BATCH_BEFORE_RUN);
     // And then deal with the requests that can be batched.
     struct BatchRemoteGetTask {

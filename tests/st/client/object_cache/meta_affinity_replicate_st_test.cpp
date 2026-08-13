@@ -109,5 +109,34 @@ TEST_F(MetaAffinityReplicateStTest, RemoteOnlyClientPutDirectlyOnMetaOwner)
     AssertBufferEqual(*buffers[0], payload);
 }
 
+TEST_F(MetaAffinityReplicateStTest, QueryMetaReturnsTcpDataWhenReplicationDisabled)
+{
+    std::shared_ptr<ObjectClient> writer;
+    InitTestClient(0, writer);
+
+    std::string objectKey;
+    GetHashKeyForMetaOwner(1, objectKey);
+    const std::string payload = RandomData().GetRandomString(512 * 1024);
+
+    CreateParam param;
+    DS_ASSERT_OK(writer->Put(objectKey, reinterpret_cast<const uint8_t *>(payload.data()), payload.size(), param));
+    WaitUntilPrimaryIs(objectKey, worker1Address_.ToString());
+
+    master::QueryMetaReqPb queryReq;
+    queryReq.add_ids(objectKey);
+    queryReq.set_address(worker0Address_.ToString());
+    master::QueryMetaRspPb queryRsp;
+    std::vector<RpcMessage> payloads;
+    DS_ASSERT_OK(worker1MasterApi_->QueryMeta(queryReq, 0, queryRsp, payloads));
+
+    ASSERT_EQ(queryRsp.query_metas_size(), 1);
+    ASSERT_GT(queryRsp.query_metas(0).payload_indexs_size(), 0);
+    size_t payloadSize = 0;
+    for (const auto &message : payloads) {
+        payloadSize += message.Size();
+    }
+    EXPECT_EQ(payloadSize, payload.size());
+}
+
 }  // namespace st
 }  // namespace datasystem

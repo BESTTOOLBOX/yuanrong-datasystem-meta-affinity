@@ -158,6 +158,7 @@ message QueryMetaReqPb {
   string request_id = 4;
   int64 timeout = 5; // rpc timeout
   bool redirect = 6;
+  QueryAndGetUbDataReqPb ub_data_request = 7;
 
   // put to the end, the previous data is used to generate AK and SK signatures.
   uint64 timestamp = 100;
@@ -170,6 +171,7 @@ message QueryMetaInfoPb {
   string address = 2;
   repeated uint32 payload_indexs = 3;
   bool single_copy = 5;
+  bool data_transferred_by_ub = 6;
 }
 
 message QueryMetaRspPb {
